@@ -2544,6 +2544,7 @@ dependencies = [
  "itertools 0.14.0",
  "js-sys",
  "log",
+ "naga 28.0.1",
  "parking_lot",
  "pollster 0.4.0",
  "profiling",

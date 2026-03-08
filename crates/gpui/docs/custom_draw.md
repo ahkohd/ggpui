@@ -1,6 +1,6 @@
 # Custom Draw
 
-Custom draw is currently implemented on the macOS Metal backend.
+Custom draw is implemented on the macOS Metal backend and has initial support on `gpui_wgpu` renderers.
 
 On backends without a custom draw registry, API entry points return an explicit error such as:
 
@@ -12,7 +12,7 @@ On backends without a custom draw registry, API entry points return an explicit 
 | Backend | Status | Notes |
 | --- | --- | --- |
 | macOS (`gpui_macos`, Metal renderer) | Implemented | Full custom draw and custom compute path in this fork |
-| `gpui_wgpu` renderer backends | Not implemented | Calls fail with explicit unsupported-platform errors |
+| `gpui_wgpu` renderer backends | Partial (initial) | Supports window-target custom render pipelines with buffer/texture/sampler/uniform bindings. Compute, offscreen targets, depth, MSAA, binding arrays, storage textures, and compressed textures are not yet implemented |
 
 ## Features
 
@@ -103,3 +103,4 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 - Binding-array support through WGSL to MSL currently works for texture arrays.
 - Buffer binding arrays in WGSL to MSL remain limited by translator support. Use precompiled MSL or `.metallib` when needed.
 - GPU timestamp and frame diagnostics samples are sourced from Metal command buffer timing and callbacks.
+- `gpui_wgpu` currently supports only window-target render pipelines with buffer/texture/sampler/uniform bindings. Unsupported features return explicit errors.

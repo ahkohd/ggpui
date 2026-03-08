@@ -1,4 +1,4 @@
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, custom_draw::WgpuCustomDrawRegistry};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
@@ -124,6 +124,7 @@ pub struct WgpuRenderer {
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
+    custom_draw: Arc<WgpuCustomDrawRegistry>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_buffer_capacity: u64,
@@ -331,6 +332,11 @@ impl WgpuRenderer {
 
         let queue = Arc::clone(&context.queue);
         let dual_source_blending = context.supports_dual_source_blending();
+        let custom_draw = Arc::new(WgpuCustomDrawRegistry::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            surface_format,
+        ));
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
@@ -453,6 +459,7 @@ impl WgpuRenderer {
             resources: Some(resources),
             surface_config,
             atlas,
+            custom_draw,
             path_globals_offset,
             gamma_offset,
             instance_buffer_capacity: initial_instance_buffer_capacity,
@@ -1018,6 +1025,10 @@ impl WgpuRenderer {
         &self.atlas
     }
 
+    pub fn custom_draw_registry(&self) -> Arc<dyn gpui::CustomDrawRegistry> {
+        self.custom_draw.clone()
+    }
+
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
     }
@@ -1230,9 +1241,33 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
-                        PrimitiveBatch::Custom(_range) => {
-                            log::error!("custom draw is not implemented on this renderer build");
-                            false
+                        PrimitiveBatch::Custom(range) => {
+                            drop(pass);
+
+                            self.custom_draw.draw_window_custom_draws(
+                                &scene.custom_draws[range],
+                                &mut encoder,
+                                &frame_view,
+                                self.surface_config.width,
+                                self.surface_config.height,
+                            );
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
                         }
                     };
                     if !ok {
