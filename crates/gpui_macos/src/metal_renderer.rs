@@ -670,6 +670,10 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::Custom(_range) => {
+                    log::error!("custom draw is not implemented on this renderer build");
+                    false
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             };
             if !ok {

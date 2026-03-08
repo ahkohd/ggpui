@@ -1230,6 +1230,10 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::Custom(_range) => {
+                            log::error!("custom draw is not implemented on this renderer build");
+                            false
+                        }
                     };
                     if !ok {
                         overflow = true;

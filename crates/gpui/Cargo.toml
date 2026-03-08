@@ -28,9 +28,7 @@ test-support = [
 ]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
-wayland = [
-    "bitflags",
-]
+wayland = []
 x11 = [
     "scap?/x11",
 ]
@@ -47,7 +45,7 @@ doctest = false
 anyhow.workspace = true
 async-task = "4.7"
 backtrace = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
+bitflags.workspace = true
 
 collections.workspace = true
 ctor.workspace = true

@@ -30,11 +30,11 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    CustomDrawRegistry, DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId,
+    FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout,
+    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
+    SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -490,6 +490,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+    fn custom_draw_registry(&self) -> Option<Arc<dyn CustomDrawRegistry>> {
+        None
+    }
     fn is_subpixel_rendering_supported(&self) -> bool;
 
     // macOS specific methods
