@@ -1860,12 +1860,198 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
 
     fn update_texture_from_buffer(
         &self,
-        _id: CustomTextureId,
-        _update: CustomTextureBufferUpdate,
+        id: CustomTextureId,
+        update: CustomTextureBufferUpdate,
     ) -> Result<()> {
-        Err(anyhow!(
-            "custom texture updates from buffer are not yet supported on wgpu"
-        ))
+        let CustomTextureBufferUpdate {
+            level,
+            buffer,
+            bytes_per_row,
+        } = update;
+
+        let texture_entry = {
+            let textures = self.textures.lock();
+            let Some(Some(texture_entry)) = textures.get(id.0 as usize) else {
+                return Err(anyhow!("custom draw texture {} not found", id.0));
+            };
+            if texture_entry.is_render_target {
+                return Err(anyhow!("custom render targets cannot be updated"));
+            }
+            texture_entry.clone()
+        };
+
+        if level >= texture_entry.mip_level_count {
+            return Err(anyhow!(
+                "custom texture mip level {} out of bounds (max {})",
+                level,
+                texture_entry.mip_level_count.saturating_sub(1)
+            ));
+        }
+
+        if texture_entry.format.is_compressed() {
+            return Err(anyhow!(
+                "compressed custom textures are not yet supported on wgpu"
+            ));
+        }
+
+        let block = texture_entry.format.block_info();
+        let mip_width = (texture_entry.width >> level).max(1);
+        let mip_height = (texture_entry.height >> level).max(1);
+        let packed_bytes_per_row = mip_width.div_ceil(block.width).saturating_mul(block.bytes);
+        let upload_bytes_per_row = bytes_per_row.unwrap_or(packed_bytes_per_row);
+
+        if upload_bytes_per_row < packed_bytes_per_row {
+            return Err(anyhow!(
+                "custom texture bytes_per_row {} is smaller than packed row size {}",
+                upload_bytes_per_row,
+                packed_bytes_per_row
+            ));
+        }
+        if !upload_bytes_per_row.is_multiple_of(block.bytes) {
+            return Err(anyhow!(
+                "custom texture bytes_per_row {} is not a multiple of block size {}",
+                upload_bytes_per_row,
+                block.bytes
+            ));
+        }
+
+        let required_bytes = u64::from(upload_bytes_per_row).saturating_mul(u64::from(mip_height));
+
+        let (source_buffer, source_offset, source_size) = {
+            let buffers = self.buffers.lock();
+            match buffer {
+                CustomBufferSource::Buffer(buffer_id) => {
+                    let Some(Some(buffer_entry)) = buffers.get(buffer_id.0 as usize) else {
+                        return Err(anyhow!("custom draw buffer {} is missing", buffer_id.0));
+                    };
+                    (buffer_entry.buffer.clone(), 0, buffer_entry.size)
+                }
+                CustomBufferSource::BufferSlice {
+                    id: buffer_id,
+                    offset,
+                    size,
+                } => {
+                    let Some(Some(buffer_entry)) = buffers.get(buffer_id.0 as usize) else {
+                        return Err(anyhow!("custom draw buffer {} is missing", buffer_id.0));
+                    };
+                    if size == 0 {
+                        return Err(anyhow!("custom texture buffer slice is empty"));
+                    }
+                    let end = offset
+                        .checked_add(size)
+                        .ok_or_else(|| anyhow!("custom texture buffer slice overflow"))?;
+                    if end > buffer_entry.size {
+                        return Err(anyhow!("custom texture buffer slice out of bounds"));
+                    }
+                    (buffer_entry.buffer.clone(), offset, size)
+                }
+                CustomBufferSource::Inline(_) => {
+                    return Err(anyhow!(
+                        "custom texture updates from buffer require a buffer source"
+                    ));
+                }
+            }
+        };
+
+        if required_bytes > source_size {
+            return Err(anyhow!(
+                "custom texture buffer upload is too small (need {} bytes, got {})",
+                required_bytes,
+                source_size
+            ));
+        }
+
+        if !source_offset.is_multiple_of(u64::from(block.bytes)) {
+            return Err(anyhow!(
+                "custom texture buffer offset {} is not aligned to block size {}",
+                source_offset,
+                block.bytes
+            ));
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("custom_texture_buffer_upload"),
+            });
+
+        if mip_height == 1 {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &source_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: source_offset,
+                        bytes_per_row: None,
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture_entry.texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: mip_width,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else if upload_bytes_per_row.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &source_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: source_offset,
+                        bytes_per_row: Some(upload_bytes_per_row),
+                        rows_per_image: Some(mip_height),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture_entry.texture,
+                    mip_level: level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: mip_width,
+                    height: mip_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            let row_size = u64::from(upload_bytes_per_row);
+            for row in 0..mip_height {
+                let row_offset = source_offset
+                    .checked_add(u64::from(row).saturating_mul(row_size))
+                    .ok_or_else(|| anyhow!("custom texture buffer row offset overflow"))?;
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &source_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: row_offset,
+                            bytes_per_row: None,
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture_entry.texture,
+                        mip_level: level,
+                        origin: wgpu::Origin3d { x: 0, y: row, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: mip_width,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(())
     }
 
     fn remove_texture(&self, id: CustomTextureId) {
