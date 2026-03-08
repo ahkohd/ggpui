@@ -147,6 +147,7 @@ lyon = { version = "1.0", features = ["extra"] }
 pretty_assertions.workspace = true
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
+smol = "2.0"
 unicode-segmentation.workspace = true
 gpui_util = { workspace = true }
 proptest = { workspace = true }
