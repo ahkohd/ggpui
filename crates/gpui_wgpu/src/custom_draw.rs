@@ -26,7 +26,7 @@ struct WgpuBindingSpec {
 #[derive(Clone)]
 struct WgpuCustomPipeline {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     bindings: Vec<WgpuBindingSpec>,
     vertex_fetch_count: usize,
 }
@@ -34,7 +34,7 @@ struct WgpuCustomPipeline {
 #[derive(Clone)]
 struct WgpuCustomComputePipeline {
     pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     bindings: Vec<WgpuBindingSpec>,
 }
 
@@ -209,7 +209,7 @@ impl WgpuCustomDrawRegistry {
                 continue;
             }
 
-            let bind_group = match self.create_draw_bind_group(
+            let bind_groups = match self.create_draw_bind_groups(
                 pipeline,
                 &draw.bindings,
                 &buffers,
@@ -217,14 +217,16 @@ impl WgpuCustomDrawRegistry {
                 &samplers,
                 &mut temporary_buffers,
             ) {
-                Ok(bind_group) => bind_group,
+                Ok(bind_groups) => bind_groups,
                 Err(error) => {
                     log::warn!("custom draw bind group creation failed: {error}");
                     continue;
                 }
             };
 
-            pass.set_bind_group(0, &bind_group, &[]);
+            for (group, bind_group) in &bind_groups {
+                pass.set_bind_group(*group, bind_group, &[]);
+            }
 
             if let Some(index_buffer) = &draw.index_buffer {
                 if let Err(error) =
@@ -283,7 +285,7 @@ impl WgpuCustomDrawRegistry {
                 continue;
             }
 
-            let bind_group = match self.create_compute_bind_group(
+            let bind_groups = match self.create_compute_bind_groups(
                 pipeline,
                 &compute.bindings,
                 &buffers,
@@ -291,7 +293,7 @@ impl WgpuCustomDrawRegistry {
                 &samplers,
                 &mut temporary_buffers,
             ) {
-                Ok(bind_group) => bind_group,
+                Ok(bind_groups) => bind_groups,
                 Err(error) => {
                     log::warn!("custom compute bind group creation failed: {error}");
                     continue;
@@ -299,7 +301,9 @@ impl WgpuCustomDrawRegistry {
             };
 
             pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            for (group, bind_group) in &bind_groups {
+                pass.set_bind_group(*group, bind_group, &[]);
+            }
             pass.dispatch_workgroups(
                 compute.workgroup_count[0],
                 compute.workgroup_count[1],
@@ -395,7 +399,7 @@ impl WgpuCustomDrawRegistry {
         Ok(())
     }
 
-    fn create_draw_bind_group(
+    fn create_draw_bind_groups(
         &self,
         pipeline: &WgpuCustomPipeline,
         binding_values: &[CustomBindingValue],
@@ -403,126 +407,20 @@ impl WgpuCustomDrawRegistry {
         textures: &[Option<WgpuCustomTexture>],
         samplers: &[Option<wgpu::Sampler>],
         temporary_buffers: &mut Vec<wgpu::Buffer>,
-    ) -> Result<wgpu::BindGroup> {
-        let mut owned_resources = Vec::with_capacity(binding_values.len());
-
-        for (binding_spec, binding_value) in pipeline.bindings.iter().zip(binding_values.iter()) {
-            match (binding_spec.kind, binding_value) {
-                (CustomBindingKind::Buffer, CustomBindingValue::Buffer(source)) => {
-                    let resource = self.resolve_buffer_resource(
-                        binding_spec.slot.binding,
-                        source,
-                        buffers,
-                        wgpu::BufferUsages::STORAGE,
-                        temporary_buffers,
-                    )?;
-                    owned_resources.push(resource);
-                }
-                (CustomBindingKind::Uniform { size }, CustomBindingValue::Uniform(source)) => {
-                    let resource = self.resolve_buffer_resource(
-                        binding_spec.slot.binding,
-                        source,
-                        buffers,
-                        wgpu::BufferUsages::UNIFORM,
-                        temporary_buffers,
-                    )?;
-
-                    let OwnedBindingResource::Buffer {
-                        binding,
-                        buffer,
-                        offset,
-                        size: available_size,
-                    } = resource
-                    else {
-                        return Err(anyhow!("expected buffer resource for uniform binding"));
-                    };
-
-                    let Some(required_size) = NonZeroU64::new(size as u64) else {
-                        return Err(anyhow!("uniform binding declared size must be non-zero"));
-                    };
-
-                    let available_size = available_size.map(|value| value.get()).unwrap_or(0);
-                    if available_size < required_size.get() {
-                        return Err(anyhow!(
-                            "uniform binding is smaller than declared size (have {}, need {})",
-                            available_size,
-                            required_size
-                        ));
-                    }
-
-                    owned_resources.push(OwnedBindingResource::Buffer {
-                        binding,
-                        buffer,
-                        offset,
-                        size: Some(required_size),
-                    });
-                }
-                (CustomBindingKind::Texture, CustomBindingValue::Texture(id)) => {
-                    let Some(Some(texture_entry)) = textures.get(id.0 as usize) else {
-                        return Err(anyhow!("custom draw texture {} is missing", id.0));
-                    };
-                    owned_resources.push(OwnedBindingResource::Texture {
-                        binding: binding_spec.slot.binding,
-                        view: texture_entry.view.clone(),
-                    });
-                }
-                (CustomBindingKind::Sampler, CustomBindingValue::Sampler(id)) => {
-                    let Some(Some(sampler)) = samplers.get(id.0 as usize) else {
-                        return Err(anyhow!("custom draw sampler {} is missing", id.0));
-                    };
-                    owned_resources.push(OwnedBindingResource::Sampler {
-                        binding: binding_spec.slot.binding,
-                        sampler: sampler.clone(),
-                    });
-                }
-                (_, value) => {
-                    return Err(anyhow!(
-                        "custom draw binding value {:?} does not match binding kind",
-                        value
-                    ));
-                }
-            }
-        }
-
-        let mut bind_group_entries = Vec::with_capacity(owned_resources.len());
-        for resource in &owned_resources {
-            match resource {
-                OwnedBindingResource::Buffer {
-                    binding,
-                    buffer,
-                    offset,
-                    size,
-                } => bind_group_entries.push(wgpu::BindGroupEntry {
-                    binding: *binding,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer,
-                        offset: *offset,
-                        size: *size,
-                    }),
-                }),
-                OwnedBindingResource::Texture { binding, view } => {
-                    bind_group_entries.push(wgpu::BindGroupEntry {
-                        binding: *binding,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    });
-                }
-                OwnedBindingResource::Sampler { binding, sampler } => {
-                    bind_group_entries.push(wgpu::BindGroupEntry {
-                        binding: *binding,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    });
-                }
-            }
-        }
-
-        Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("custom_draw_bind_group"),
-            layout: &pipeline.bind_group_layout,
-            entries: &bind_group_entries,
-        }))
+    ) -> Result<Vec<(u32, wgpu::BindGroup)>> {
+        self.create_bind_groups(
+            "custom_draw_bind_group",
+            &pipeline.bind_group_layouts,
+            &pipeline.bindings,
+            binding_values,
+            buffers,
+            textures,
+            samplers,
+            temporary_buffers,
+        )
     }
 
-    fn create_compute_bind_group(
+    fn create_compute_bind_groups(
         &self,
         pipeline: &WgpuCustomComputePipeline,
         binding_values: &[CustomBindingValue],
@@ -530,10 +428,40 @@ impl WgpuCustomDrawRegistry {
         textures: &[Option<WgpuCustomTexture>],
         samplers: &[Option<wgpu::Sampler>],
         temporary_buffers: &mut Vec<wgpu::Buffer>,
-    ) -> Result<wgpu::BindGroup> {
-        let mut owned_resources = Vec::with_capacity(binding_values.len());
+    ) -> Result<Vec<(u32, wgpu::BindGroup)>> {
+        self.create_bind_groups(
+            "custom_compute_bind_group",
+            &pipeline.bind_group_layouts,
+            &pipeline.bindings,
+            binding_values,
+            buffers,
+            textures,
+            samplers,
+            temporary_buffers,
+        )
+    }
 
-        for (binding_spec, binding_value) in pipeline.bindings.iter().zip(binding_values.iter()) {
+    fn create_bind_groups(
+        &self,
+        label: &str,
+        bind_group_layouts: &[wgpu::BindGroupLayout],
+        binding_specs: &[WgpuBindingSpec],
+        binding_values: &[CustomBindingValue],
+        buffers: &[Option<WgpuCustomBuffer>],
+        textures: &[Option<WgpuCustomTexture>],
+        samplers: &[Option<wgpu::Sampler>],
+        temporary_buffers: &mut Vec<wgpu::Buffer>,
+    ) -> Result<Vec<(u32, wgpu::BindGroup)>> {
+        let mut owned_resources_by_group: std::collections::BTreeMap<
+            u32,
+            Vec<OwnedBindingResource>,
+        > = std::collections::BTreeMap::new();
+
+        for (binding_spec, binding_value) in binding_specs.iter().zip(binding_values.iter()) {
+            let owned_resources = owned_resources_by_group
+                .entry(binding_spec.slot.group)
+                .or_default();
+
             match (binding_spec.kind, binding_value) {
                 (CustomBindingKind::Buffer, CustomBindingValue::Buffer(source)) => {
                     let resource = self.resolve_buffer_resource(
@@ -612,42 +540,60 @@ impl WgpuCustomDrawRegistry {
             }
         }
 
-        let mut bind_group_entries = Vec::with_capacity(owned_resources.len());
-        for resource in &owned_resources {
-            match resource {
-                OwnedBindingResource::Buffer {
-                    binding,
-                    buffer,
-                    offset,
-                    size,
-                } => bind_group_entries.push(wgpu::BindGroupEntry {
-                    binding: *binding,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        let mut bind_groups = Vec::new();
+
+        for (group, mut owned_resources) in owned_resources_by_group {
+            owned_resources.sort_by_key(|resource| match resource {
+                OwnedBindingResource::Buffer { binding, .. }
+                | OwnedBindingResource::Texture { binding, .. }
+                | OwnedBindingResource::Sampler { binding, .. } => *binding,
+            });
+
+            let mut bind_group_entries = Vec::with_capacity(owned_resources.len());
+            for resource in &owned_resources {
+                match resource {
+                    OwnedBindingResource::Buffer {
+                        binding,
                         buffer,
-                        offset: *offset,
-                        size: *size,
+                        offset,
+                        size,
+                    } => bind_group_entries.push(wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer,
+                            offset: *offset,
+                            size: *size,
+                        }),
                     }),
-                }),
-                OwnedBindingResource::Texture { binding, view } => {
-                    bind_group_entries.push(wgpu::BindGroupEntry {
-                        binding: *binding,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    });
-                }
-                OwnedBindingResource::Sampler { binding, sampler } => {
-                    bind_group_entries.push(wgpu::BindGroupEntry {
-                        binding: *binding,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    });
+                    OwnedBindingResource::Texture { binding, view } => {
+                        bind_group_entries.push(wgpu::BindGroupEntry {
+                            binding: *binding,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        });
+                    }
+                    OwnedBindingResource::Sampler { binding, sampler } => {
+                        bind_group_entries.push(wgpu::BindGroupEntry {
+                            binding: *binding,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        });
+                    }
                 }
             }
+
+            let Some(bind_group_layout) = bind_group_layouts.get(group as usize) else {
+                return Err(anyhow!("custom draw bind group {} is out of range", group));
+            };
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: bind_group_layout,
+                entries: &bind_group_entries,
+            });
+
+            bind_groups.push((group, bind_group));
         }
 
-        Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("custom_compute_bind_group"),
-            layout: &pipeline.bind_group_layout,
-            entries: &bind_group_entries,
-        }))
+        Ok(bind_groups)
     }
 
     fn resolve_buffer_resource(
@@ -781,15 +727,6 @@ impl WgpuCustomDrawRegistry {
         }
 
         for binding in &desc.bindings {
-            let slot = binding.slot.unwrap_or(CustomBindingSlot {
-                group: 0,
-                binding: binding.name.index(),
-            });
-            if slot.group != 0 {
-                return Err(anyhow!(
-                    "custom draw bind groups above group 0 are not yet supported on wgpu"
-                ));
-            }
             match binding.kind {
                 CustomBindingKind::Buffer
                 | CustomBindingKind::Texture
@@ -884,7 +821,8 @@ impl WgpuCustomDrawRegistry {
             });
 
         let mut binding_specs = Vec::with_capacity(desc.bindings.len());
-        let mut bind_group_layout_entries = Vec::with_capacity(desc.bindings.len());
+        let mut bind_group_layout_entries_by_group: Vec<Vec<wgpu::BindGroupLayoutEntry>> =
+            Vec::new();
 
         for binding in &desc.bindings {
             let slot = binding.slot.unwrap_or(CustomBindingSlot {
@@ -895,28 +833,42 @@ impl WgpuCustomDrawRegistry {
                 kind: binding.kind,
                 slot,
             });
-            bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                binding: slot.binding,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: map_binding_type(binding.kind, None)?,
-                count: None,
-            });
+
+            if bind_group_layout_entries_by_group.len() <= slot.group as usize {
+                bind_group_layout_entries_by_group.resize_with(slot.group as usize + 1, Vec::new);
+            }
+
+            bind_group_layout_entries_by_group[slot.group as usize].push(
+                wgpu::BindGroupLayoutEntry {
+                    binding: slot.binding,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: map_binding_type(binding.kind, None)?,
+                    count: None,
+                },
+            );
         }
 
-        bind_group_layout_entries.sort_by_key(|entry| entry.binding);
+        let mut bind_group_layouts = Vec::with_capacity(bind_group_layout_entries_by_group.len());
+        for (group_index, mut entries) in bind_group_layout_entries_by_group.into_iter().enumerate()
+        {
+            entries.sort_by_key(|entry| entry.binding);
+            let bind_group_layout =
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some(&format!("custom_draw_bind_group_layout_{}", group_index)),
+                        entries: &entries,
+                    });
+            bind_group_layouts.push(bind_group_layout);
+        }
 
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("custom_draw_bind_group_layout"),
-                    entries: &bind_group_layout_entries,
-                });
+        let bind_group_layout_refs: Vec<&wgpu::BindGroupLayout> =
+            bind_group_layouts.iter().collect();
 
         let pipeline_layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("custom_draw_pipeline_layout"),
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &bind_group_layout_refs,
                 immediate_size: 0,
             });
 
@@ -1003,7 +955,7 @@ impl WgpuCustomDrawRegistry {
 
         Ok(WgpuCustomPipeline {
             pipeline: render_pipeline,
-            bind_group_layout,
+            bind_group_layouts,
             bindings: binding_specs,
             vertex_fetch_count: desc.vertex_fetches.len(),
         })
@@ -1020,15 +972,6 @@ impl WgpuCustomDrawRegistry {
         }
 
         for binding in &desc.bindings {
-            let slot = binding.slot.unwrap_or(CustomBindingSlot {
-                group: 0,
-                binding: binding.name.index(),
-            });
-            if slot.group != 0 {
-                return Err(anyhow!(
-                    "custom compute bind groups above group 0 are not yet supported on wgpu"
-                ));
-            }
             match binding.kind {
                 CustomBindingKind::Buffer
                 | CustomBindingKind::Texture
@@ -1096,7 +1039,8 @@ impl WgpuCustomDrawRegistry {
             });
 
         let mut binding_specs = Vec::with_capacity(desc.bindings.len());
-        let mut bind_group_layout_entries = Vec::with_capacity(desc.bindings.len());
+        let mut bind_group_layout_entries_by_group: Vec<Vec<wgpu::BindGroupLayoutEntry>> =
+            Vec::new();
 
         for binding in &desc.bindings {
             let slot = binding.slot.unwrap_or(CustomBindingSlot {
@@ -1115,28 +1059,41 @@ impl WgpuCustomDrawRegistry {
                     .copied(),
             )?;
 
-            bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
-                binding: slot.binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: binding_type,
-                count: None,
-            });
+            if bind_group_layout_entries_by_group.len() <= slot.group as usize {
+                bind_group_layout_entries_by_group.resize_with(slot.group as usize + 1, Vec::new);
+            }
+
+            bind_group_layout_entries_by_group[slot.group as usize].push(
+                wgpu::BindGroupLayoutEntry {
+                    binding: slot.binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: binding_type,
+                    count: None,
+                },
+            );
         }
 
-        bind_group_layout_entries.sort_by_key(|entry| entry.binding);
+        let mut bind_group_layouts = Vec::with_capacity(bind_group_layout_entries_by_group.len());
+        for (group_index, mut entries) in bind_group_layout_entries_by_group.into_iter().enumerate()
+        {
+            entries.sort_by_key(|entry| entry.binding);
+            let bind_group_layout =
+                self.device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some(&format!("custom_compute_bind_group_layout_{}", group_index)),
+                        entries: &entries,
+                    });
+            bind_group_layouts.push(bind_group_layout);
+        }
 
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("custom_compute_bind_group_layout"),
-                    entries: &bind_group_layout_entries,
-                });
+        let bind_group_layout_refs: Vec<&wgpu::BindGroupLayout> =
+            bind_group_layouts.iter().collect();
 
         let pipeline_layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("custom_compute_pipeline_layout"),
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &bind_group_layout_refs,
                 immediate_size: 0,
             });
 
@@ -1153,7 +1110,7 @@ impl WgpuCustomDrawRegistry {
 
         Ok(WgpuCustomComputePipeline {
             pipeline: compute_pipeline,
-            bind_group_layout,
+            bind_group_layouts,
             bindings: binding_specs,
         })
     }
