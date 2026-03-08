@@ -6,27 +6,33 @@ use crate::{Bounds, ContentMask, Pixels, Result, ScaledPixels};
 
 /// Identifier for a registered custom GPU pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomPipelineId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomPipelineId(pub u32);
 
 /// Identifier for a registered custom compute pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomComputePipelineId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomComputePipelineId(pub u32);
 
 /// Identifier for a registered custom buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomBufferId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomBufferId(pub u32);
 
 /// Identifier for a registered custom texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomTextureId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomTextureId(pub u32);
 
 /// Identifier for a registered custom sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomSamplerId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomSamplerId(pub u32);
 
 /// Identifier for a registered custom depth target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CustomDepthTargetId(pub(crate) u32);
+#[allow(missing_docs)]
+pub struct CustomDepthTargetId(pub u32);
 
 /// Primitive topology for custom pipelines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,14 +1133,17 @@ pub enum CustomTextureFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CustomTexelBlockInfo {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) bytes: u32,
+#[allow(missing_docs)]
+#[doc(hidden)]
+pub struct CustomTexelBlockInfo {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u32,
 }
 
 impl CustomTextureFormat {
-    pub(crate) const fn block_info(self) -> CustomTexelBlockInfo {
+    /// Returns block width/height and byte size for this format.
+    pub const fn block_info(self) -> CustomTexelBlockInfo {
         match self {
             CustomTextureFormat::Rgba8Unorm
             | CustomTextureFormat::Bgra8Unorm
@@ -1204,7 +1213,8 @@ impl CustomTextureFormat {
         }
     }
 
-    pub(crate) const fn is_compressed(self) -> bool {
+    /// Returns true when this format uses block compression.
+    pub const fn is_compressed(self) -> bool {
         let info = self.block_info();
         info.width > 1 || info.height > 1
     }
@@ -1479,33 +1489,36 @@ pub struct CustomSamplerDesc {
 #[allow(dead_code, missing_docs)]
 #[doc(hidden)]
 pub struct CustomDraw {
-    pub(crate) order: u32,
-    pub(crate) bounds: Bounds<ScaledPixels>,
-    pub(crate) content_mask: ContentMask<ScaledPixels>,
-    pub(crate) pipeline: CustomPipelineId,
-    pub(crate) vertex_buffers: Vec<CustomVertexBuffer>,
-    pub(crate) vertex_count: u32,
-    pub(crate) index_buffer: Option<CustomIndexBuffer>,
-    pub(crate) index_count: u32,
-    pub(crate) target: Option<CustomRenderTarget>,
-    pub(crate) instance_count: u32,
-    pub(crate) bindings: Vec<CustomBindingValue>,
-    pub(crate) batch_key: CustomBatchKey,
+    pub order: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub pipeline: CustomPipelineId,
+    pub vertex_buffers: Vec<CustomVertexBuffer>,
+    pub vertex_count: u32,
+    pub index_buffer: Option<CustomIndexBuffer>,
+    pub index_count: u32,
+    pub target: Option<CustomRenderTarget>,
+    pub instance_count: u32,
+    pub bindings: Vec<CustomBindingValue>,
+    pub batch_key: CustomBatchKey,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct CustomCompute {
-    pub(crate) pipeline: CustomComputePipelineId,
-    pub(crate) bindings: Vec<CustomBindingValue>,
-    pub(crate) workgroup_count: [u32; 3],
+#[allow(dead_code, missing_docs)]
+#[doc(hidden)]
+pub struct CustomCompute {
+    pub pipeline: CustomComputePipelineId,
+    pub bindings: Vec<CustomBindingValue>,
+    pub workgroup_count: [u32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct CustomBatchKey {
-    pub(crate) pipeline: CustomPipelineId,
-    pub(crate) target_hash: u64,
-    pub(crate) bindings_hash: u64,
+#[allow(missing_docs)]
+#[doc(hidden)]
+pub struct CustomBatchKey {
+    pub pipeline: CustomPipelineId,
+    pub target_hash: u64,
+    pub bindings_hash: u64,
 }
 
 #[allow(missing_docs)]

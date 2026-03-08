@@ -36,8 +36,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-    pub(crate) custom_draws: Vec<CustomDraw>,
-    pub(crate) custom_computes: Vec<CustomCompute>,
+    pub custom_draws: Vec<CustomDraw>,
+    pub custom_computes: Vec<CustomCompute>,
 }
 
 #[expect(missing_docs)]
