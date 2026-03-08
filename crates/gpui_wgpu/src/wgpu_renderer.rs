@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1134,6 +1135,11 @@ impl WgpuRenderer {
             );
         }
 
+        let custom_draw_count = u32::try_from(scene.custom_draws.len()).unwrap_or(u32::MAX);
+        let custom_compute_count = u32::try_from(scene.custom_computes.len()).unwrap_or(u32::MAX);
+        let frame_encode_start = Instant::now();
+        let mut retry_count = 0u32;
+
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
@@ -1145,9 +1151,11 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
-            self.custom_draw
+            let custom_compute_pass_count = self
+                .custom_draw
                 .dispatch_custom_computes(&scene.custom_computes, &mut encoder);
-            self.custom_draw
+            let mut custom_render_pass_count = self
+                .custom_draw
                 .draw_custom_render_targets(&scene.custom_draws, &mut encoder);
 
             {
@@ -1249,12 +1257,14 @@ impl WgpuRenderer {
                         PrimitiveBatch::Custom(range) => {
                             drop(pass);
 
-                            self.custom_draw.draw_window_custom_draws(
-                                &scene.custom_draws[range],
-                                &mut encoder,
-                                &frame_view,
-                                self.surface_config.width,
-                                self.surface_config.height,
+                            custom_render_pass_count = custom_render_pass_count.saturating_add(
+                                self.custom_draw.draw_window_custom_draws(
+                                    &scene.custom_draws[range],
+                                    &mut encoder,
+                                    &frame_view,
+                                    self.surface_config.width,
+                                    self.surface_config.height,
+                                ),
                             );
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1293,8 +1303,20 @@ impl WgpuRenderer {
                     return;
                 }
                 self.grow_instance_buffer();
+                retry_count = retry_count.saturating_add(1);
                 continue;
             }
+
+            let cpu_encode_time_ns =
+                u64::try_from(frame_encode_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.custom_draw.record_frame_metrics(
+                custom_draw_count,
+                custom_compute_count,
+                custom_render_pass_count,
+                custom_compute_pass_count,
+                retry_count,
+                cpu_encode_time_ns,
+            );
 
             self.resources()
                 .queue

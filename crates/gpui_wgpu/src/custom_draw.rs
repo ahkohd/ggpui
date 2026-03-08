@@ -75,6 +75,14 @@ struct WgpuCustomDepthTarget {
     format: wgpu::TextureFormat,
 }
 
+#[derive(Default)]
+struct WgpuCustomProfilingState {
+    gpu_profiling_enabled: bool,
+    frame_diagnostics_enabled: bool,
+    last_gpu_profile: Option<CustomGpuFrameProfile>,
+    last_frame_diagnostics: Option<CustomFrameDiagnostics>,
+}
+
 #[derive(Clone, Copy)]
 struct BindingInfo {
     kind: CustomBindingKind,
@@ -136,6 +144,7 @@ pub(crate) struct WgpuCustomDrawRegistry {
     textures: Mutex<Vec<Option<WgpuCustomTexture>>>,
     depth_targets: Mutex<Vec<Option<WgpuCustomDepthTarget>>>,
     samplers: Mutex<Vec<Option<wgpu::Sampler>>>,
+    profiling: Mutex<WgpuCustomProfilingState>,
 }
 
 impl WgpuCustomDrawRegistry {
@@ -154,6 +163,44 @@ impl WgpuCustomDrawRegistry {
             textures: Mutex::new(Vec::new()),
             depth_targets: Mutex::new(Vec::new()),
             samplers: Mutex::new(Vec::new()),
+            profiling: Mutex::new(WgpuCustomProfilingState::default()),
+        }
+    }
+
+    pub(crate) fn record_frame_metrics(
+        &self,
+        custom_draw_count: u32,
+        custom_compute_count: u32,
+        custom_render_pass_count: u32,
+        custom_compute_pass_count: u32,
+        retry_count: u32,
+        cpu_encode_time_ns: u64,
+    ) {
+        let mut profiling = self.profiling.lock();
+
+        if profiling.gpu_profiling_enabled {
+            profiling.last_gpu_profile = Some(CustomGpuFrameProfile {
+                custom_draw_count,
+                custom_compute_count,
+                custom_render_pass_count,
+                custom_compute_pass_count,
+                gpu_time_ns: None,
+            });
+        }
+
+        if profiling.frame_diagnostics_enabled {
+            profiling.last_frame_diagnostics = Some(CustomFrameDiagnostics {
+                custom_draw_count,
+                custom_compute_count,
+                custom_render_pass_count,
+                custom_compute_pass_count,
+                retry_count,
+                cpu_encode_time_ns,
+                submit_to_scheduled_ns: None,
+                submit_to_completed_ns: None,
+                scheduled_to_completed_ns: None,
+                gpu_time_ns: None,
+            });
         }
     }
 
@@ -164,15 +211,15 @@ impl WgpuCustomDrawRegistry {
         frame_view: &wgpu::TextureView,
         viewport_width: u32,
         viewport_height: u32,
-    ) {
+    ) -> u32 {
         if draws.is_empty() {
-            return;
+            return 0;
         }
 
         let window_draws: Vec<&CustomDraw> =
             draws.iter().filter(|draw| draw.target.is_none()).collect();
         if window_draws.is_empty() {
-            return;
+            return 0;
         }
 
         let pipelines = self.pipelines.lock().clone();
@@ -210,15 +257,17 @@ impl WgpuCustomDrawRegistry {
             Some((viewport_width, viewport_height)),
             &mut temporary_buffers,
         );
+
+        1
     }
 
     pub(crate) fn draw_custom_render_targets(
         &self,
         draws: &[CustomDraw],
         encoder: &mut wgpu::CommandEncoder,
-    ) {
+    ) -> u32 {
         if draws.is_empty() {
-            return;
+            return 0;
         }
 
         let mut draws_by_target: BTreeMap<(Vec<u32>, Option<u32>), Vec<&CustomDraw>> =
@@ -234,7 +283,7 @@ impl WgpuCustomDrawRegistry {
                 .push(draw);
         }
         if draws_by_target.is_empty() {
-            return;
+            return 0;
         }
 
         let pipelines = self.pipelines.lock().clone();
@@ -242,6 +291,7 @@ impl WgpuCustomDrawRegistry {
         let textures = self.textures.lock().clone();
         let depth_targets = self.depth_targets.lock().clone();
         let samplers = self.samplers.lock().clone();
+        let mut render_pass_count = 0u32;
 
         'render_target: for (_, target_draws) in draws_by_target {
             let Some(target) = target_draws.first().and_then(|draw| draw.target.as_ref()) else {
@@ -352,6 +402,7 @@ impl WgpuCustomDrawRegistry {
                         stencil_ops: None,
                     });
 
+            render_pass_count = render_pass_count.saturating_add(1);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("custom_draw_offscreen_pass"),
                 color_attachments: &color_attachments,
@@ -374,6 +425,8 @@ impl WgpuCustomDrawRegistry {
                 &mut temporary_buffers,
             );
         }
+
+        render_pass_count
     }
 
     fn draw_custom_draws_for_target(
@@ -548,9 +601,9 @@ impl WgpuCustomDrawRegistry {
         &self,
         computes: &[CustomCompute],
         encoder: &mut wgpu::CommandEncoder,
-    ) {
+    ) -> u32 {
         if computes.is_empty() {
-            return;
+            return 0;
         }
 
         let compute_pipelines = self.compute_pipelines.lock().clone();
@@ -611,6 +664,8 @@ impl WgpuCustomDrawRegistry {
                 compute.workgroup_count[2],
             );
         }
+
+        1
     }
 
     fn set_vertex_buffer(
@@ -1725,24 +1780,30 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         ))
     }
 
-    fn set_gpu_profiling_enabled(&self, _enabled: bool) -> Result<()> {
-        Err(anyhow!(
-            "custom draw GPU profiling is not yet supported on wgpu"
-        ))
+    fn set_gpu_profiling_enabled(&self, enabled: bool) -> Result<()> {
+        let mut profiling = self.profiling.lock();
+        profiling.gpu_profiling_enabled = enabled;
+        if !enabled {
+            profiling.last_gpu_profile = None;
+        }
+        Ok(())
     }
 
     fn take_last_gpu_profile(&self) -> Option<CustomGpuFrameProfile> {
-        None
+        self.profiling.lock().last_gpu_profile.take()
     }
 
-    fn set_frame_diagnostics_enabled(&self, _enabled: bool) -> Result<()> {
-        Err(anyhow!(
-            "custom draw frame diagnostics are not yet supported on wgpu"
-        ))
+    fn set_frame_diagnostics_enabled(&self, enabled: bool) -> Result<()> {
+        let mut profiling = self.profiling.lock();
+        profiling.frame_diagnostics_enabled = enabled;
+        if !enabled {
+            profiling.last_frame_diagnostics = None;
+        }
+        Ok(())
     }
 
     fn take_last_frame_diagnostics(&self) -> Option<CustomFrameDiagnostics> {
-        None
+        self.profiling.lock().last_frame_diagnostics.take()
     }
 
     fn resource_stats(&self) -> CustomDrawResourceStats {
