@@ -2,17 +2,17 @@ use anyhow::anyhow;
 use gpui::{
     Bounds, CustomAddressMode, CustomBindingDesc, CustomBindingKind, CustomBindingSlot,
     CustomBindingValue, CustomBufferDesc, CustomBufferId, CustomBufferSource, CustomCompute,
-    CustomComputePipelineDesc, CustomComputePipelineId, CustomCullMode, CustomDepthTargetDesc,
-    CustomDepthTargetId, CustomDraw, CustomDrawRegistry, CustomDrawResourceStats, CustomFilterMode,
-    CustomFrameDiagnostics, CustomFrontFace, CustomGpuFrameProfile, CustomIndexBuffer,
-    CustomIndexFormat, CustomPipelineDesc, CustomPipelineId, CustomPrimitiveTopology,
-    CustomRenderTargetDesc, CustomSamplerDesc, CustomSamplerId, CustomTextureBufferUpdate,
-    CustomTextureDesc, CustomTextureDimension, CustomTextureFormat, CustomTextureId,
-    CustomTextureUpdate, CustomTextureUsage, CustomVertexFetch, CustomVertexFormat, Result,
-    ScaledPixels,
+    CustomComputePipelineDesc, CustomComputePipelineId, CustomCullMode, CustomDepthCompare,
+    CustomDepthFormat, CustomDepthTargetDesc, CustomDepthTargetId, CustomDraw, CustomDrawRegistry,
+    CustomDrawResourceStats, CustomFilterMode, CustomFrameDiagnostics, CustomFrontFace,
+    CustomGpuFrameProfile, CustomIndexBuffer, CustomIndexFormat, CustomPipelineDesc,
+    CustomPipelineId, CustomPrimitiveTopology, CustomRenderTargetDesc, CustomSamplerDesc,
+    CustomSamplerId, CustomTextureBufferUpdate, CustomTextureDesc, CustomTextureDimension,
+    CustomTextureFormat, CustomTextureId, CustomTextureUpdate, CustomTextureUsage,
+    CustomVertexFetch, CustomVertexFormat, Result, ScaledPixels,
 };
 use parking_lot::Mutex;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,11 +23,16 @@ struct WgpuBindingSpec {
     slot: CustomBindingSlot,
 }
 
+const MAX_SAMPLE_COUNT: u32 = 8;
+
 #[derive(Clone)]
 struct WgpuCustomPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     bindings: Vec<WgpuBindingSpec>,
+    color_formats: Vec<wgpu::TextureFormat>,
+    sample_count: u32,
+    depth_format: Option<wgpu::TextureFormat>,
     vertex_fetch_count: usize,
 }
 
@@ -48,11 +53,25 @@ struct WgpuCustomBuffer {
 struct WgpuCustomTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    msaa_texture: Option<wgpu::Texture>,
+    msaa_view: Option<wgpu::TextureView>,
     width: u32,
     height: u32,
     mip_level_count: u32,
+    sample_count: u32,
     format: CustomTextureFormat,
+    clear_color: [f32; 4],
     is_render_target: bool,
+}
+
+#[derive(Clone)]
+struct WgpuCustomDepthTarget {
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    clear_depth: f32,
+    format: wgpu::TextureFormat,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +112,7 @@ pub(crate) struct WgpuCustomDrawRegistry {
     compute_pipelines: Mutex<Vec<Option<WgpuCustomComputePipeline>>>,
     buffers: Mutex<Vec<Option<WgpuCustomBuffer>>>,
     textures: Mutex<Vec<Option<WgpuCustomTexture>>>,
+    depth_targets: Mutex<Vec<Option<WgpuCustomDepthTarget>>>,
     samplers: Mutex<Vec<Option<wgpu::Sampler>>>,
 }
 
@@ -110,6 +130,7 @@ impl WgpuCustomDrawRegistry {
             compute_pipelines: Mutex::new(Vec::new()),
             buffers: Mutex::new(Vec::new()),
             textures: Mutex::new(Vec::new()),
+            depth_targets: Mutex::new(Vec::new()),
             samplers: Mutex::new(Vec::new()),
         }
     }
@@ -123,6 +144,12 @@ impl WgpuCustomDrawRegistry {
         viewport_height: u32,
     ) {
         if draws.is_empty() {
+            return;
+        }
+
+        let window_draws: Vec<&CustomDraw> =
+            draws.iter().filter(|draw| draw.target.is_none()).collect();
+        if window_draws.is_empty() {
             return;
         }
 
@@ -147,13 +174,201 @@ impl WgpuCustomDrawRegistry {
         });
 
         let mut temporary_buffers: Vec<wgpu::Buffer> = Vec::new();
+        let color_formats = [self.surface_format];
+        self.draw_custom_draws_for_target(
+            &window_draws,
+            &pipelines,
+            &buffers,
+            &textures,
+            &samplers,
+            &mut pass,
+            &color_formats,
+            1,
+            None,
+            Some((viewport_width, viewport_height)),
+            &mut temporary_buffers,
+        );
+    }
 
+    pub(crate) fn draw_custom_render_targets(
+        &self,
+        draws: &[CustomDraw],
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+
+        let mut draws_by_target: BTreeMap<(Vec<u32>, Option<u32>), Vec<&CustomDraw>> =
+            BTreeMap::new();
         for draw in draws {
-            if draw.target.is_some() {
-                log::warn!("custom draw offscreen targets are not yet implemented on wgpu");
+            let Some(target) = draw.target.as_ref() else {
                 continue;
+            };
+            let colors: Vec<u32> = target.colors.iter().map(|color| color.0).collect();
+            draws_by_target
+                .entry((colors, target.depth.map(|depth| depth.0)))
+                .or_default()
+                .push(draw);
+        }
+        if draws_by_target.is_empty() {
+            return;
+        }
+
+        let pipelines = self.pipelines.lock().clone();
+        let buffers = self.buffers.lock().clone();
+        let textures = self.textures.lock().clone();
+        let depth_targets = self.depth_targets.lock().clone();
+        let samplers = self.samplers.lock().clone();
+
+        'render_target: for (_, target_draws) in draws_by_target {
+            let Some(target) = target_draws.first().and_then(|draw| draw.target.as_ref()) else {
+                continue;
+            };
+
+            let mut color_targets = Vec::with_capacity(target.colors.len());
+            for color_id in &target.colors {
+                let Some(Some(color_target)) = textures.get(color_id.0 as usize) else {
+                    log::warn!("custom render target {} is missing", color_id.0);
+                    continue 'render_target;
+                };
+                if !color_target.is_render_target {
+                    log::warn!("custom texture {} is not a render target", color_id.0);
+                    continue 'render_target;
+                }
+                if color_target.sample_count > 1 && color_target.msaa_view.is_none() {
+                    log::warn!("custom render target {} is missing MSAA data", color_id.0);
+                    continue 'render_target;
+                }
+                color_targets.push(color_target.clone());
             }
 
+            let Some(first_target) = color_targets.first() else {
+                continue;
+            };
+
+            for color_target in &color_targets[1..] {
+                if color_target.width != first_target.width
+                    || color_target.height != first_target.height
+                {
+                    log::warn!("custom render targets must match in size");
+                    continue 'render_target;
+                }
+                if color_target.sample_count != first_target.sample_count {
+                    log::warn!("custom render targets must match in sample count");
+                    continue 'render_target;
+                }
+            }
+
+            let depth_target = if let Some(depth_id) = target.depth {
+                let Some(Some(depth_target)) = depth_targets.get(depth_id.0 as usize) else {
+                    log::warn!("custom depth target {} is missing", depth_id.0);
+                    continue 'render_target;
+                };
+                Some(depth_target.clone())
+            } else {
+                None
+            };
+
+            if let Some(depth_target) = depth_target.as_ref() {
+                if depth_target.width != first_target.width
+                    || depth_target.height != first_target.height
+                {
+                    log::warn!("custom depth target size mismatch");
+                    continue 'render_target;
+                }
+                if depth_target.sample_count != first_target.sample_count {
+                    log::warn!("custom depth target sample count mismatch");
+                    continue 'render_target;
+                }
+            }
+
+            let mut color_formats = Vec::with_capacity(color_targets.len());
+            for color_target in &color_targets {
+                let Some(color_format) = map_texture_format(color_target.format) else {
+                    log::warn!(
+                        "custom render target format {:?} is not supported",
+                        color_target.format
+                    );
+                    continue 'render_target;
+                };
+                color_formats.push(color_format);
+            }
+
+            let mut color_attachments = Vec::with_capacity(color_targets.len());
+            for color_target in &color_targets {
+                let attachment_view = color_target
+                    .msaa_view
+                    .as_ref()
+                    .unwrap_or(&color_target.view);
+                color_attachments.push(Some(wgpu::RenderPassColorAttachment {
+                    view: attachment_view,
+                    resolve_target: color_target.msaa_view.as_ref().map(|_| &color_target.view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: color_target.clear_color[0] as f64,
+                            g: color_target.clear_color[1] as f64,
+                            b: color_target.clear_color[2] as f64,
+                            a: color_target.clear_color[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }));
+            }
+
+            let depth_format = depth_target.as_ref().map(|target| target.format);
+            let depth_stencil_attachment =
+                depth_target
+                    .as_ref()
+                    .map(|depth_target| wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_target.view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(depth_target.clear_depth),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    });
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("custom_draw_offscreen_pass"),
+                color_attachments: &color_attachments,
+                depth_stencil_attachment,
+                ..Default::default()
+            });
+
+            let mut temporary_buffers = Vec::new();
+            self.draw_custom_draws_for_target(
+                &target_draws,
+                &pipelines,
+                &buffers,
+                &textures,
+                &samplers,
+                &mut pass,
+                &color_formats,
+                first_target.sample_count,
+                depth_format,
+                None,
+                &mut temporary_buffers,
+            );
+        }
+    }
+
+    fn draw_custom_draws_for_target(
+        &self,
+        draws: &[&CustomDraw],
+        pipelines: &[Option<WgpuCustomPipeline>],
+        buffers: &[Option<WgpuCustomBuffer>],
+        textures: &[Option<WgpuCustomTexture>],
+        samplers: &[Option<wgpu::Sampler>],
+        pass: &mut wgpu::RenderPass<'_>,
+        color_formats: &[wgpu::TextureFormat],
+        sample_count: u32,
+        depth_format: Option<wgpu::TextureFormat>,
+        viewport_size: Option<(u32, u32)>,
+        temporary_buffers: &mut Vec<wgpu::Buffer>,
+    ) {
+        for draw in draws {
             let pipeline_index = draw.pipeline.0 as usize;
             let Some(Some(pipeline)) = pipelines.get(pipeline_index) else {
                 log::warn!("missing custom draw pipeline {}", draw.pipeline.0);
@@ -180,31 +395,45 @@ impl WgpuCustomDrawRegistry {
                 continue;
             }
 
-            let Some((scissor_x, scissor_y, scissor_width, scissor_height)) =
-                clip_bounds_to_viewport(draw.content_mask.bounds, viewport_width, viewport_height)
-            else {
+            if !self.pipeline_matches_target(
+                pipeline,
+                draw.pipeline,
+                color_formats,
+                sample_count,
+                depth_format,
+            ) {
                 continue;
-            };
+            }
+
+            if let Some((viewport_width, viewport_height)) = viewport_size {
+                let Some((scissor_x, scissor_y, scissor_width, scissor_height)) =
+                    clip_bounds_to_viewport(
+                        draw.content_mask.bounds,
+                        viewport_width,
+                        viewport_height,
+                    )
+                else {
+                    continue;
+                };
+                pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
+            }
 
             pass.set_pipeline(&pipeline.pipeline);
-            pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
 
             let mut draw_failed = false;
-
             for (slot_index, vertex_buffer) in draw.vertex_buffers.iter().enumerate() {
                 if let Err(error) = self.set_vertex_buffer(
-                    &mut pass,
+                    pass,
                     slot_index as u32,
                     &vertex_buffer.source,
-                    &buffers,
-                    &mut temporary_buffers,
+                    buffers,
+                    temporary_buffers,
                 ) {
                     log::warn!("custom draw vertex buffer binding failed: {error}");
                     draw_failed = true;
                     break;
                 }
             }
-
             if draw_failed {
                 continue;
             }
@@ -212,10 +441,10 @@ impl WgpuCustomDrawRegistry {
             let bind_groups = match self.create_draw_bind_groups(
                 pipeline,
                 &draw.bindings,
-                &buffers,
-                &textures,
-                &samplers,
-                &mut temporary_buffers,
+                buffers,
+                textures,
+                samplers,
+                temporary_buffers,
             ) {
                 Ok(bind_groups) => bind_groups,
                 Err(error) => {
@@ -230,17 +459,67 @@ impl WgpuCustomDrawRegistry {
 
             if let Some(index_buffer) = &draw.index_buffer {
                 if let Err(error) =
-                    self.set_index_buffer(&mut pass, index_buffer, &buffers, &mut temporary_buffers)
+                    self.set_index_buffer(pass, index_buffer, buffers, temporary_buffers)
                 {
                     log::warn!("custom draw index buffer binding failed: {error}");
                     continue;
                 }
-
                 pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
             } else {
                 pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
         }
+    }
+
+    fn pipeline_matches_target(
+        &self,
+        pipeline: &WgpuCustomPipeline,
+        pipeline_id: CustomPipelineId,
+        color_formats: &[wgpu::TextureFormat],
+        sample_count: u32,
+        depth_format: Option<wgpu::TextureFormat>,
+    ) -> bool {
+        if pipeline.color_formats.len() != color_formats.len() {
+            log::warn!(
+                "custom draw pipeline {} expects {} color targets, got {}",
+                pipeline_id.0,
+                pipeline.color_formats.len(),
+                color_formats.len()
+            );
+            return false;
+        }
+
+        for (expected, actual) in pipeline.color_formats.iter().zip(color_formats.iter()) {
+            if expected != actual {
+                log::warn!(
+                    "custom draw pipeline {} color target format mismatch",
+                    pipeline_id.0
+                );
+                return false;
+            }
+        }
+
+        if pipeline.sample_count != sample_count {
+            log::warn!(
+                "custom draw pipeline {} sample count mismatch (expected {}, got {})",
+                pipeline_id.0,
+                pipeline.sample_count,
+                sample_count
+            );
+            return false;
+        }
+
+        if let Some(pipeline_depth_format) = pipeline.depth_format {
+            if Some(pipeline_depth_format) != depth_format {
+                log::warn!(
+                    "custom draw pipeline {} depth format mismatch",
+                    pipeline_id.0
+                );
+                return false;
+            }
+        }
+
+        true
     }
 
     pub(crate) fn dispatch_custom_computes(
@@ -710,19 +989,14 @@ impl WgpuCustomDrawRegistry {
                 "custom draw push constants are not yet supported on wgpu"
             ));
         }
-        if !desc.color_targets.is_empty() {
+        if desc.state.sample_count == 0
+            || desc.state.sample_count > MAX_SAMPLE_COUNT
+            || !desc.state.sample_count.is_power_of_two()
+        {
             return Err(anyhow!(
-                "custom draw offscreen color targets are not yet supported on wgpu"
-            ));
-        }
-        if desc.state.depth.is_some() {
-            return Err(anyhow!(
-                "custom draw depth state is not yet supported on wgpu"
-            ));
-        }
-        if desc.state.sample_count != 1 {
-            return Err(anyhow!(
-                "custom draw sample counts above 1 are not yet supported on wgpu"
+                "custom draw sample count must be a power of two between 1 and {} (got {})",
+                MAX_SAMPLE_COUNT,
+                desc.state.sample_count
             ));
         }
 
@@ -911,11 +1185,39 @@ impl WgpuCustomDrawRegistry {
             });
         }
 
-        let color_target = Some(wgpu::ColorTargetState {
-            format: self.surface_format,
-            blend: map_blend_state(desc.state.blend),
-            write_mask: wgpu::ColorWrites::ALL,
+        let color_formats = if desc.color_targets.is_empty() {
+            vec![self.surface_format]
+        } else {
+            let mut formats = Vec::with_capacity(desc.color_targets.len());
+            for color_target in &desc.color_targets {
+                let Some(format) = map_texture_format(*color_target) else {
+                    return Err(anyhow!(
+                        "custom draw color target format {:?} is not supported on this wgpu renderer",
+                        color_target
+                    ));
+                };
+                formats.push(format);
+            }
+            formats
+        };
+
+        let mut color_targets = Vec::with_capacity(color_formats.len());
+        for format in &color_formats {
+            color_targets.push(Some(wgpu::ColorTargetState {
+                format: *format,
+                blend: map_blend_state(desc.state.blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }));
+        }
+
+        let depth_stencil = desc.state.depth.map(|depth_state| wgpu::DepthStencilState {
+            format: map_depth_format(depth_state.format),
+            depth_write_enabled: depth_state.write_enabled,
+            depth_compare: map_depth_compare(depth_state.compare),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
         });
+        let depth_format = depth_stencil.as_ref().map(|state| state.format);
 
         let render_pipeline = self
             .device
@@ -931,7 +1233,7 @@ impl WgpuCustomDrawRegistry {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader_module,
                     entry_point: Some(&desc.fragment_entry),
-                    targets: &[color_target],
+                    targets: &color_targets,
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
@@ -943,9 +1245,9 @@ impl WgpuCustomDrawRegistry {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: None,
+                depth_stencil,
                 multisample: wgpu::MultisampleState {
-                    count: 1,
+                    count: desc.state.sample_count,
                     mask: !0,
                     alpha_to_coverage_enabled: false,
                 },
@@ -957,6 +1259,9 @@ impl WgpuCustomDrawRegistry {
             pipeline: render_pipeline,
             bind_group_layouts,
             bindings: binding_specs,
+            color_formats,
+            sample_count: desc.state.sample_count,
+            depth_format,
             vertex_fetch_count: desc.vertex_fetches.len(),
         })
     }
@@ -1131,6 +1436,16 @@ impl WgpuCustomDrawRegistry {
             );
         }
 
+        if texture.is_render_target && texture.sample_count > 1 && texture.msaa_texture.is_some() {
+            let blocks_x = texture.width.div_ceil(block.width);
+            let blocks_y = texture.height.div_ceil(block.height);
+            let msaa_bytes = u64::from(blocks_x)
+                .saturating_mul(u64::from(blocks_y))
+                .saturating_mul(u64::from(block.bytes))
+                .saturating_mul(u64::from(texture.sample_count));
+            total_bytes = total_bytes.saturating_add(msaa_bytes);
+        }
+
         total_bytes
     }
 
@@ -1268,6 +1583,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         let compute_pipelines = self.compute_pipelines.lock();
         let buffers = self.buffers.lock();
         let textures = self.textures.lock();
+        let depth_targets = self.depth_targets.lock();
         let samplers = self.samplers.lock();
 
         let buffer_bytes = buffers
@@ -1286,6 +1602,14 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             .filter(|entry| entry.is_render_target)
             .count() as u32;
 
+        let depth_target_bytes = depth_targets
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+            .map(|entry| depth_target_estimate_bytes(entry.width, entry.height, entry.sample_count))
+            .sum();
+        let depth_target_count =
+            depth_targets.iter().filter(|entry| entry.is_some()).count() as u32;
+
         CustomDrawResourceStats {
             pipeline_count: pipelines.iter().filter(|entry| entry.is_some()).count() as u32,
             compute_pipeline_count: compute_pipelines
@@ -1297,8 +1621,8 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             texture_count: textures.iter().filter(|entry| entry.is_some()).count() as u32,
             texture_bytes,
             render_target_count,
-            depth_target_count: 0,
-            depth_target_bytes: 0,
+            depth_target_count,
+            depth_target_bytes,
             sampler_count: samplers.iter().filter(|entry| entry.is_some()).count() as u32,
         }
     }
@@ -1415,10 +1739,14 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         let texture_entry = WgpuCustomTexture {
             texture,
             view,
+            msaa_texture: None,
+            msaa_view: None,
             width: desc.width.max(1),
             height: desc.height.max(1),
             mip_level_count,
+            sample_count: 1,
             format: desc.format,
+            clear_color: [0.0; 4],
             is_render_target: false,
         };
 
@@ -1431,10 +1759,87 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         Ok(CustomTextureId(texture_id))
     }
 
-    fn create_render_target(&self, _desc: CustomRenderTargetDesc) -> Result<CustomTextureId> {
-        Err(anyhow!(
-            "custom draw offscreen render targets are not yet supported on wgpu"
-        ))
+    fn create_render_target(&self, desc: CustomRenderTargetDesc) -> Result<CustomTextureId> {
+        if desc.format.is_compressed() {
+            return Err(anyhow!(
+                "custom render targets must not use compressed formats"
+            ));
+        }
+        if desc.sample_count == 0
+            || desc.sample_count > MAX_SAMPLE_COUNT
+            || !desc.sample_count.is_power_of_two()
+        {
+            return Err(anyhow!(
+                "custom draw render target sample count must be a power of two between 1 and {} (got {})",
+                MAX_SAMPLE_COUNT,
+                desc.sample_count
+            ));
+        }
+
+        let Some(texture_format) = map_texture_format(desc.format) else {
+            return Err(anyhow!(
+                "custom render target format {:?} is not supported by this wgpu renderer",
+                desc.format
+            ));
+        };
+
+        let width = desc.width.max(1);
+        let height = desc.height.max(1);
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&desc.name),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: texture_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let (msaa_texture, msaa_view) = if desc.sample_count > 1 {
+            let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("{}_msaa", desc.name)),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: desc.sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: texture_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(msaa_texture), Some(msaa_view))
+        } else {
+            (None, None)
+        };
+
+        let texture_entry = WgpuCustomTexture {
+            texture,
+            view,
+            msaa_texture,
+            msaa_view,
+            width,
+            height,
+            mip_level_count: 1,
+            sample_count: desc.sample_count,
+            format: desc.format,
+            clear_color: desc.clear_color.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+            is_render_target: true,
+        };
+
+        let mut textures = self.textures.lock();
+        let texture_id = alloc_slot(&mut textures, texture_entry);
+        Ok(CustomTextureId(texture_id))
     }
 
     fn update_texture(&self, id: CustomTextureId, update: CustomTextureUpdate) -> Result<()> {
@@ -1442,6 +1847,9 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         let Some(Some(texture_entry)) = textures.get(id.0 as usize) else {
             return Err(anyhow!("custom draw texture {} not found", id.0));
         };
+        if texture_entry.is_render_target {
+            return Err(anyhow!("custom render targets cannot be updated"));
+        }
         self.upload_texture_level(
             texture_entry,
             update.level,
@@ -1467,13 +1875,58 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         }
     }
 
-    fn create_depth_target(&self, _desc: CustomDepthTargetDesc) -> Result<CustomDepthTargetId> {
-        Err(anyhow!(
-            "custom draw depth targets are not yet supported on wgpu"
-        ))
+    fn create_depth_target(&self, desc: CustomDepthTargetDesc) -> Result<CustomDepthTargetId> {
+        if desc.sample_count == 0
+            || desc.sample_count > MAX_SAMPLE_COUNT
+            || !desc.sample_count.is_power_of_two()
+        {
+            return Err(anyhow!(
+                "custom draw depth target sample count must be a power of two between 1 and {} (got {})",
+                MAX_SAMPLE_COUNT,
+                desc.sample_count
+            ));
+        }
+
+        let width = desc.width.max(1);
+        let height = desc.height.max(1);
+        let format = map_depth_format(desc.format);
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&desc.name),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: desc.sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let entry = WgpuCustomDepthTarget {
+            view,
+            width,
+            height,
+            sample_count: desc.sample_count,
+            clear_depth: desc.clear_depth.unwrap_or(1.0),
+            format,
+        };
+
+        let mut depth_targets = self.depth_targets.lock();
+        let target_id = alloc_slot(&mut depth_targets, entry);
+        Ok(CustomDepthTargetId(target_id))
     }
 
-    fn remove_depth_target(&self, _id: CustomDepthTargetId) {}
+    fn remove_depth_target(&self, id: CustomDepthTargetId) {
+        let mut depth_targets = self.depth_targets.lock();
+        if let Some(slot) = depth_targets.get_mut(id.0 as usize) {
+            slot.take();
+        }
+    }
 
     fn create_sampler(&self, desc: CustomSamplerDesc) -> Result<CustomSamplerId> {
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1573,6 +2026,22 @@ fn map_custom_storage_texture_format(format: CustomTextureFormat) -> Option<wgpu
         CustomTextureFormat::Rgba8Unorm => Some(wgpu::TextureFormat::Rgba8Unorm),
         CustomTextureFormat::Bgra8Unorm => Some(wgpu::TextureFormat::Bgra8Unorm),
         _ => None,
+    }
+}
+
+fn map_depth_format(format: CustomDepthFormat) -> wgpu::TextureFormat {
+    match format {
+        CustomDepthFormat::Depth32Float => wgpu::TextureFormat::Depth32Float,
+    }
+}
+
+fn map_depth_compare(compare: CustomDepthCompare) -> wgpu::CompareFunction {
+    match compare {
+        CustomDepthCompare::Always => wgpu::CompareFunction::Always,
+        CustomDepthCompare::Less => wgpu::CompareFunction::Less,
+        CustomDepthCompare::LessEqual => wgpu::CompareFunction::LessEqual,
+        CustomDepthCompare::Greater => wgpu::CompareFunction::Greater,
+        CustomDepthCompare::GreaterEqual => wgpu::CompareFunction::GreaterEqual,
     }
 }
 
@@ -1736,6 +2205,13 @@ fn map_blend_state(blend_mode: gpui::CustomBlendMode) -> Option<wgpu::BlendState
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)
         }
     }
+}
+
+fn depth_target_estimate_bytes(width: u32, height: u32, sample_count: u32) -> u64 {
+    u64::from(width.max(1))
+        .saturating_mul(u64::from(height.max(1)))
+        .saturating_mul(4)
+        .saturating_mul(u64::from(sample_count.max(1)))
 }
 
 fn clip_bounds_to_viewport(

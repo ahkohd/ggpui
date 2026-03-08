@@ -1,6 +1,6 @@
 # Custom Draw
 
-Custom draw is implemented on the macOS Metal backend and has initial support on `gpui_wgpu` renderers.
+Custom draw is implemented on the macOS Metal backend and has partial support on `gpui_wgpu` renderers.
 
 On backends without a custom draw registry, API entry points return an explicit error such as:
 
@@ -12,7 +12,7 @@ On backends without a custom draw registry, API entry points return an explicit 
 | Backend | Status | Notes |
 | --- | --- | --- |
 | macOS (`gpui_macos`, Metal renderer) | Implemented | Full custom draw and custom compute path in this fork |
-| `gpui_wgpu` renderer backends | Partial (initial) | Supports window-target custom render pipelines and custom compute pipelines with buffer/texture/sampler/uniform bindings, plus 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`). Explicit group/binding slots (including multi-group) work for non-array bindings. Offscreen targets, depth, MSAA, binding arrays, push constants, and compressed textures are not yet implemented |
+| `gpui_wgpu` renderer backends | Partial | Supports window-target and offscreen custom render pipelines (multiple color targets, `Depth32Float`, MSAA), plus custom compute pipelines with buffer/texture/sampler/uniform bindings and 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`). Explicit group/binding slots (including multi-group) work for non-array bindings. Binding arrays, push constants, compressed textures, texture arrays/cubemaps, and texture updates from buffer are not yet implemented |
 
 ## Features
 
@@ -103,4 +103,4 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 - Binding-array support through WGSL to MSL currently works for texture arrays.
 - Buffer binding arrays in WGSL to MSL remain limited by translator support. Use precompiled MSL or `.metallib` when needed.
 - GPU timestamp and frame diagnostics samples are sourced from Metal command buffer timing and callbacks.
-- `gpui_wgpu` currently supports window-target render pipelines and custom compute pipelines with buffer/texture/sampler/uniform bindings, explicit group/binding slots for non-array bindings, and 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`). Unsupported features return explicit errors.
+- `gpui_wgpu` currently supports window-target and offscreen render pipelines (multiple color targets, `Depth32Float`, MSAA), custom compute pipelines with buffer/texture/sampler/uniform bindings, explicit group/binding slots for non-array bindings, and 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`). Unsupported features still return explicit errors.
