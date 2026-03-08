@@ -1,92 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/acp_thread",
-    "crates/acp_tools",
-    "crates/action_log",
-    "crates/activity_indicator",
-    "crates/agent",
-    "crates/agent_servers",
-    "crates/agent_settings",
-    "crates/agent_ui",
-    "crates/ai_onboarding",
-    "crates/anthropic",
-    "crates/askpass",
-    "crates/assets",
-    "crates/assistant_slash_command",
-    "crates/assistant_slash_commands",
-    "crates/assistant_text_thread",
-    "crates/audio",
-    "crates/auto_update",
-    "crates/auto_update_helper",
-    "crates/auto_update_ui",
-    "crates/aws_http_client",
-    "crates/bedrock",
-    "crates/breadcrumbs",
-    "crates/buffer_diff",
-    "crates/call",
-    "crates/channel",
-    "crates/cli",
-    "crates/client",
-    "crates/clock",
-    "crates/cloud_api_client",
-    "crates/cloud_api_types",
-    "crates/cloud_llm_client",
-    "crates/codestral",
-    "crates/collab",
-    "crates/collab_ui",
     "crates/collections",
-    "crates/command_palette",
-    "crates/command_palette_hooks",
-    "crates/component",
-    "crates/component_preview",
-    "crates/context_server",
-    "crates/copilot",
-    "crates/copilot_chat",
-    "crates/crashes",
-    "crates/credentials_provider",
-    "crates/csv_preview",
-    "crates/dap",
-    "crates/dap_adapters",
-    "crates/db",
-    "crates/debug_adapter_extension",
-    "crates/debugger_tools",
-    "crates/debugger_ui",
-    "crates/deepseek",
-    "crates/denoise",
-    "crates/dev_container",
-    "crates/diagnostics",
-    "crates/docs_preprocessor",
-    "crates/edit_prediction",
-    "crates/edit_prediction_cli",
-    "crates/edit_prediction_context",
-    "crates/edit_prediction_types",
-    "crates/edit_prediction_ui",
-    "crates/editor",
-    "crates/encoding_selector",
-    "crates/etw_tracing",
-    "crates/eval",
-    "crates/eval_cli",
-    "crates/eval_utils",
-    "crates/explorer_command_injector",
-    "crates/extension",
-    "crates/extension_api",
-    "crates/extension_cli",
-    "crates/extension_host",
-    "crates/extensions_ui",
-    "crates/feature_flags",
-    "crates/feedback",
-    "crates/file_finder",
-    "crates/file_icons",
-    "crates/fs",
-    "crates/fs_benchmarks",
-    "crates/fuzzy",
-    "crates/git",
-    "crates/git_graph",
-    "crates/git_hosting_providers",
-    "crates/git_ui",
-    "crates/go_to_line",
-    "crates/google_ai",
     "crates/gpui",
     "crates/gpui_linux",
     "crates/gpui_macos",
@@ -97,154 +12,22 @@ members = [
     "crates/gpui_web",
     "crates/gpui_wgpu",
     "crates/gpui_windows",
-    "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
-    "crates/icons",
-    "crates/image_viewer",
-    "crates/inspector_ui",
-    "crates/install_cli",
-    "crates/journal",
-    "crates/json_schema_store",
-    "crates/keymap_editor",
-    "crates/language",
-    "crates/language_extension",
-    "crates/language_model",
-    "crates/language_models",
-    "crates/language_onboarding",
-    "crates/language_selector",
-    "crates/language_tools",
-    "crates/languages",
-    "crates/line_ending_selector",
-    "crates/livekit_api",
-    "crates/livekit_client",
-    "crates/lmstudio",
-    "crates/lsp",
-    "crates/markdown",
-    "crates/markdown_preview",
     "crates/media",
-    "crates/menu",
-    "crates/migrator",
-    "crates/miniprofiler_ui",
-    "crates/mistral",
-    "crates/multi_buffer",
-    "crates/nc",
-    "crates/net",
-    "crates/node_runtime",
-    "crates/notifications",
-    "crates/ollama",
-    "crates/onboarding",
-    "crates/open_ai",
-    "crates/open_path_prompt",
-    "crates/open_router",
-    "crates/outline",
-    "crates/outline_panel",
-    "crates/panel",
-    "crates/paths",
-    "crates/picker",
-    "crates/platform_title_bar",
-    "crates/prettier",
-    "crates/project",
-    "crates/project_benchmarks",
-    "crates/project_panel",
-    "crates/project_symbols",
-    "crates/prompt_store",
-    "crates/proto",
-    "crates/recent_projects",
     "crates/refineable",
     "crates/refineable/derive_refineable",
-    "crates/release_channel",
-    "crates/remote",
-    "crates/remote_connection",
-    "crates/remote_server",
-    "crates/repl",
     "crates/reqwest_client",
-    "crates/rich_text",
-    "crates/rope",
-    "crates/rpc",
-    "crates/rules_library",
     "crates/scheduler",
-    "crates/schema_generator",
-    "crates/search",
-    "crates/session",
-    "crates/settings",
-    "crates/settings_content",
-    "crates/settings_json",
-    "crates/settings_macros",
-    "crates/settings_profile_selector",
-    "crates/settings_ui",
-    "crates/shell_command_parser",
-    "crates/sidebar",
-    "crates/snippet",
-    "crates/snippet_provider",
-    "crates/snippets_ui",
-    "crates/sqlez",
-    "crates/sqlez_macros",
-    "crates/story",
-    "crates/storybook",
-    "crates/streaming_diff",
     "crates/sum_tree",
-    "crates/svg_preview",
-    "crates/system_specs",
-    "crates/tab_switcher",
-    "crates/task",
-    "crates/tasks_ui",
-    "crates/telemetry",
-    "crates/telemetry_events",
-    "crates/terminal",
-    "crates/terminal_view",
-    "crates/text",
-    "crates/theme",
-    "crates/theme_extension",
-    "crates/theme_importer",
-    "crates/theme_selector",
-    "crates/time_format",
-    "crates/title_bar",
-    "crates/toolchain_selector",
-    "crates/ui",
-    "crates/ui_input",
-    "crates/ui_macros",
-    "crates/ui_prompt",
     "crates/util",
     "crates/util_macros",
-    "crates/vercel",
-    "crates/vim",
-    "crates/vim_mode_setting",
-    "crates/watch",
-    "crates/web_search",
-    "crates/web_search_providers",
-    "crates/which_key",
-    "crates/workspace",
-    "crates/worktree",
-    "crates/worktree_benchmarks",
-    "crates/x_ai",
-    "crates/zed",
-    "crates/zed_actions",
-    "crates/zed_env_vars",
-    "crates/zeta_prompt",
     "crates/zlog",
-    "crates/zlog_settings",
     "crates/ztracing",
     "crates/ztracing_macro",
-
-    #
-    # Extensions
-    #
-
-    "extensions/glsl",
-    "extensions/html",
-    "extensions/proto",
-    "extensions/slash-commands-example",
-    "extensions/test-extension",
-
-    #
-    # Tooling
-    #
-
     "tooling/perf",
-    "tooling/xtask",
 ]
-default-members = ["crates/zed"]
+default-members = ["crates/gpui"]
 
 [workspace.package]
 publish = false
@@ -847,12 +630,8 @@ features = [
 
 [patch.crates-io]
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
-notify = { git = "https://github.com/zed-industries/notify.git", rev = "ce58c24cad542c28e04ced02e20325a4ec28a31d" }
-notify-types = { git = "https://github.com/zed-industries/notify.git", rev = "ce58c24cad542c28e04ced02e20325a4ec28a31d" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
-livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
-libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
@@ -867,56 +646,23 @@ split-debuginfo = "unpacked"
 debug = true
 
 [profile.dev.package]
-# proc-macros start
+# proc-macros
 gpui_macros = { opt-level = 3 }
 derive_refineable = { opt-level = 3 }
-settings_macros = { opt-level = 3 }
-sqlez_macros = { opt-level = 3, codegen-units = 1 }
-ui_macros = { opt-level = 3 }
 util_macros = { opt-level = 3 }
 quote = { opt-level = 3 }
 syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }
-# proc-macros end
 
+# Heavier dependencies
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
-wasmtime = { opt-level = 3 }
-# Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
-activity_indicator = { codegen-units = 1 }
-assets = { codegen-units = 1 }
-breadcrumbs = { codegen-units = 1 }
+
+# Single-source-file workspace crates
 collections = { codegen-units = 1 }
-command_palette = { codegen-units = 1 }
-command_palette_hooks = { codegen-units = 1 }
-feature_flags = { codegen-units = 1 }
-file_icons = { codegen-units = 1 }
-image_viewer = { codegen-units = 1 }
-edit_prediction_ui = { codegen-units = 1 }
-install_cli = { codegen-units = 1 }
-journal = { codegen-units = 1 }
-json_schema_store = { codegen-units = 1 }
-lmstudio = { codegen-units = 1 }
-menu = { codegen-units = 1 }
-notifications = { codegen-units = 1 }
-ollama = { codegen-units = 1 }
-outline = { codegen-units = 1 }
-paths = { codegen-units = 1 }
-prettier = { codegen-units = 1 }
-project_symbols = { codegen-units = 1 }
 refineable = { codegen-units = 1 }
-release_channel = { codegen-units = 1 }
 reqwest_client = { codegen-units = 1 }
-session = { codegen-units = 1 }
-sidebar = { codegen-units = 1 }
-snippet = { codegen-units = 1 }
-snippets_ui = { codegen-units = 1 }
-story = { codegen-units = 1 }
-telemetry_events = { codegen-units = 1 }
-theme_selector = { codegen-units = 1 }
-time_format = { codegen-units = 1 }
-ui_input = { codegen-units = 1 }
-zed_actions = { codegen-units = 1 }
+ztracing_macro = { codegen-units = 1 }
 
 [profile.release]
 debug = "limited"
@@ -924,7 +670,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+gpui = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
