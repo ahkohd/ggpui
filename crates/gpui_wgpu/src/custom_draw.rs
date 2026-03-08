@@ -1492,12 +1492,6 @@ impl WgpuCustomDrawRegistry {
             ));
         }
 
-        if texture.format.is_compressed() {
-            return Err(anyhow!(
-                "compressed custom textures are not yet supported on wgpu"
-            ));
-        }
-
         let block = texture.format.block_info();
         let mip_width = (texture.width >> level).max(1);
         let mip_height = (texture.height >> level).max(1);
@@ -1658,7 +1652,10 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
     }
 
     fn texture_format_supported(&self, format: CustomTextureFormat) -> bool {
-        map_texture_format(format).is_some()
+        let Some(texture_format) = map_texture_format(format) else {
+            return false;
+        };
+        texture_format_supported_by_device(self.device.features(), texture_format)
     }
 
     fn create_compute_pipeline(
@@ -1705,18 +1702,20 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
     }
 
     fn create_texture(&self, desc: CustomTextureDesc) -> Result<CustomTextureId> {
-        if desc.format.is_compressed() {
-            return Err(anyhow!(
-                "compressed custom textures are not yet supported on wgpu"
-            ));
-        }
-
         let Some(texture_format) = map_texture_format(desc.format) else {
             return Err(anyhow!(
                 "custom texture format {:?} is not supported by this wgpu renderer",
                 desc.format
             ));
         };
+
+        let device_features = self.device.features();
+        if !texture_format_supported_by_device(device_features, texture_format) {
+            return Err(anyhow!(
+                "custom texture format {:?} is not supported by this wgpu renderer",
+                desc.format
+            ));
+        }
 
         if matches!(desc.dimension, CustomTextureDimension::Cube) && desc.width != desc.height {
             return Err(anyhow!(
@@ -1744,6 +1743,14 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             if storage_format != texture_format {
                 return Err(anyhow!(
                     "custom texture format {:?} cannot be used as a storage texture on wgpu",
+                    desc.format
+                ));
+            }
+            if texture_format == wgpu::TextureFormat::Bgra8Unorm
+                && !device_features.contains(wgpu::Features::BGRA8UNORM_STORAGE)
+            {
+                return Err(anyhow!(
+                    "custom texture format {:?} requires BGRA8 storage support on this wgpu renderer",
                     desc.format
                 ));
             }
@@ -1934,7 +1941,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
 
         if texture_entry.format.is_compressed() {
             return Err(anyhow!(
-                "compressed custom textures are not yet supported on wgpu"
+                "compressed custom texture updates from buffer are not yet supported on wgpu"
             ));
         }
 
@@ -2270,8 +2277,64 @@ fn map_texture_format(format: CustomTextureFormat) -> Option<wgpu::TextureFormat
         CustomTextureFormat::Bgra8Unorm => Some(wgpu::TextureFormat::Bgra8Unorm),
         CustomTextureFormat::Rgba8UnormSrgb => Some(wgpu::TextureFormat::Rgba8UnormSrgb),
         CustomTextureFormat::Bgra8UnormSrgb => Some(wgpu::TextureFormat::Bgra8UnormSrgb),
-        _ => None,
+        CustomTextureFormat::Bc1Unorm => Some(wgpu::TextureFormat::Bc1RgbaUnorm),
+        CustomTextureFormat::Bc1UnormSrgb => Some(wgpu::TextureFormat::Bc1RgbaUnormSrgb),
+        CustomTextureFormat::Bc3Unorm => Some(wgpu::TextureFormat::Bc3RgbaUnorm),
+        CustomTextureFormat::Bc3UnormSrgb => Some(wgpu::TextureFormat::Bc3RgbaUnormSrgb),
+        CustomTextureFormat::Bc7Unorm => Some(wgpu::TextureFormat::Bc7RgbaUnorm),
+        CustomTextureFormat::Bc7UnormSrgb => Some(wgpu::TextureFormat::Bc7RgbaUnormSrgb),
+        CustomTextureFormat::Etc2Rgb8Unorm => Some(wgpu::TextureFormat::Etc2Rgb8Unorm),
+        CustomTextureFormat::Etc2Rgb8UnormSrgb => Some(wgpu::TextureFormat::Etc2Rgb8UnormSrgb),
+        CustomTextureFormat::Etc2Rgba8Unorm => Some(wgpu::TextureFormat::Etc2Rgba8Unorm),
+        CustomTextureFormat::Etc2Rgba8UnormSrgb => Some(wgpu::TextureFormat::Etc2Rgba8UnormSrgb),
+        CustomTextureFormat::Astc4x4Unorm => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B4x4,
+            channel: wgpu::AstcChannel::Unorm,
+        }),
+        CustomTextureFormat::Astc4x4UnormSrgb => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B4x4,
+            channel: wgpu::AstcChannel::UnormSrgb,
+        }),
+        CustomTextureFormat::Astc5x5Unorm => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B5x5,
+            channel: wgpu::AstcChannel::Unorm,
+        }),
+        CustomTextureFormat::Astc5x5UnormSrgb => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B5x5,
+            channel: wgpu::AstcChannel::UnormSrgb,
+        }),
+        CustomTextureFormat::Astc6x6Unorm => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B6x6,
+            channel: wgpu::AstcChannel::Unorm,
+        }),
+        CustomTextureFormat::Astc6x6UnormSrgb => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B6x6,
+            channel: wgpu::AstcChannel::UnormSrgb,
+        }),
+        CustomTextureFormat::Astc8x8Unorm => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B8x8,
+            channel: wgpu::AstcChannel::Unorm,
+        }),
+        CustomTextureFormat::Astc8x8UnormSrgb => Some(wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B8x8,
+            channel: wgpu::AstcChannel::UnormSrgb,
+        }),
+        CustomTextureFormat::PvrtcRgb2bppUnorm
+        | CustomTextureFormat::PvrtcRgb2bppUnormSrgb
+        | CustomTextureFormat::PvrtcRgba2bppUnorm
+        | CustomTextureFormat::PvrtcRgba2bppUnormSrgb
+        | CustomTextureFormat::PvrtcRgb4bppUnorm
+        | CustomTextureFormat::PvrtcRgb4bppUnormSrgb
+        | CustomTextureFormat::PvrtcRgba4bppUnorm
+        | CustomTextureFormat::PvrtcRgba4bppUnormSrgb => None,
     }
+}
+
+fn texture_format_supported_by_device(
+    device_features: wgpu::Features,
+    texture_format: wgpu::TextureFormat,
+) -> bool {
+    device_features.contains(texture_format.required_features())
 }
 
 fn map_custom_storage_texture_format(format: CustomTextureFormat) -> Option<wgpu::TextureFormat> {

@@ -120,6 +120,8 @@ impl WgpuContext {
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
+        let adapter_features = adapter.features();
+
         let mut required_features = wgpu::Features::empty();
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
@@ -128,6 +130,17 @@ impl WgpuContext {
                 "Dual-source blending not available on this GPU. \
                 Subpixel text antialiasing will be disabled."
             );
+        }
+
+        for optional_feature in [
+            wgpu::Features::TEXTURE_COMPRESSION_BC,
+            wgpu::Features::TEXTURE_COMPRESSION_ETC2,
+            wgpu::Features::TEXTURE_COMPRESSION_ASTC,
+            wgpu::Features::BGRA8UNORM_STORAGE,
+        ] {
+            if adapter_features.contains(optional_feature) {
+                required_features |= optional_feature;
+            }
         }
 
         let (device, queue) = adapter
