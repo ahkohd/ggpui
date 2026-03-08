@@ -57,6 +57,7 @@ struct WgpuCustomTexture {
     msaa_view: Option<wgpu::TextureView>,
     width: u32,
     height: u32,
+    array_layer_count: u32,
     mip_level_count: u32,
     sample_count: u32,
     format: CustomTextureFormat,
@@ -80,11 +81,18 @@ struct BindingInfo {
     slot: CustomBindingSlot,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct WgpuStorageTextureBindingInfo {
     format: wgpu::TextureFormat,
     access: wgpu::StorageTextureAccess,
     view_dimension: wgpu::TextureViewDimension,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WgpuSampledTextureBindingInfo {
+    sample_type: wgpu::TextureSampleType,
+    view_dimension: wgpu::TextureViewDimension,
+    multisampled: bool,
 }
 
 enum OwnedBindingResource {
@@ -1083,6 +1091,13 @@ impl WgpuCustomDrawRegistry {
         .validate(&module)
         .map_err(|error| anyhow!("custom draw WGSL validation failed: {error}"))?;
 
+        let mut sampled_texture_infos =
+            collect_sampled_texture_binding_info(&module, &info, vertex_entry_index)?;
+        merge_sampled_texture_binding_infos(
+            &mut sampled_texture_infos,
+            collect_sampled_texture_binding_info(&module, &info, fragment_entry_index)?,
+        )?;
+
         let rewritten_wgsl =
             naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
                 .map_err(|error| anyhow!("custom draw WGSL rewrite failed: {error}"))?;
@@ -1116,7 +1131,13 @@ impl WgpuCustomDrawRegistry {
                 wgpu::BindGroupLayoutEntry {
                     binding: slot.binding,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: map_binding_type(binding.kind, None)?,
+                    ty: map_binding_type(
+                        binding.kind,
+                        None,
+                        sampled_texture_infos
+                            .get(&(slot.group, slot.binding))
+                            .copied(),
+                    )?,
                     count: None,
                 },
             );
@@ -1331,6 +1352,8 @@ impl WgpuCustomDrawRegistry {
 
         let storage_texture_infos =
             collect_storage_texture_binding_info(&module, &info, compute_entry_index)?;
+        let sampled_texture_infos =
+            collect_sampled_texture_binding_info(&module, &info, compute_entry_index)?;
 
         let rewritten_wgsl =
             naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
@@ -1360,6 +1383,9 @@ impl WgpuCustomDrawRegistry {
             let binding_type = map_binding_type(
                 binding.kind,
                 storage_texture_infos
+                    .get(&(slot.group, slot.binding))
+                    .copied(),
+                sampled_texture_infos
                     .get(&(slot.group, slot.binding))
                     .copied(),
             )?;
@@ -1432,7 +1458,8 @@ impl WgpuCustomDrawRegistry {
             total_bytes = total_bytes.saturating_add(
                 u64::from(blocks_x)
                     .saturating_mul(u64::from(blocks_y))
-                    .saturating_mul(u64::from(block.bytes)),
+                    .saturating_mul(u64::from(block.bytes))
+                    .saturating_mul(u64::from(texture.array_layer_count)),
             );
         }
 
@@ -1442,6 +1469,7 @@ impl WgpuCustomDrawRegistry {
             let msaa_bytes = u64::from(blocks_x)
                 .saturating_mul(u64::from(blocks_y))
                 .saturating_mul(u64::from(block.bytes))
+                .saturating_mul(u64::from(texture.array_layer_count))
                 .saturating_mul(u64::from(texture.sample_count));
             total_bytes = total_bytes.saturating_add(msaa_bytes);
         }
@@ -1491,7 +1519,9 @@ impl WgpuCustomDrawRegistry {
             ));
         }
 
-        let required_bytes = u64::from(upload_bytes_per_row).saturating_mul(u64::from(mip_height));
+        let required_bytes = u64::from(upload_bytes_per_row)
+            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(u64::from(texture.array_layer_count));
         if required_bytes > data.len() as u64 {
             return Err(anyhow!(
                 "custom texture upload is too small (need {} bytes, got {})",
@@ -1516,7 +1546,7 @@ impl WgpuCustomDrawRegistry {
             wgpu::Extent3d {
                 width: mip_width,
                 height: mip_height,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: texture.array_layer_count,
             },
         );
 
@@ -1675,11 +1705,6 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
     }
 
     fn create_texture(&self, desc: CustomTextureDesc) -> Result<CustomTextureId> {
-        if desc.dimension != CustomTextureDimension::D2 {
-            return Err(anyhow!(
-                "custom texture arrays and cubemaps are not yet supported on wgpu"
-            ));
-        }
         if desc.format.is_compressed() {
             return Err(anyhow!(
                 "compressed custom textures are not yet supported on wgpu"
@@ -1693,11 +1718,23 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             ));
         };
 
+        if matches!(desc.dimension, CustomTextureDimension::Cube) && desc.width != desc.height {
+            return Err(anyhow!(
+                "custom cube textures require width and height to match"
+            ));
+        }
+
+        let array_layer_count = desc.dimension.array_layers();
+        let view_dimension = map_texture_view_dimension(desc.dimension)?;
+
         let mut texture_usage = wgpu::TextureUsages::COPY_DST;
         if desc.usage.contains(CustomTextureUsage::SAMPLED) {
             texture_usage |= wgpu::TextureUsages::TEXTURE_BINDING;
         }
         if desc.usage.contains(CustomTextureUsage::STORAGE) {
+            if desc.dimension.is_array() {
+                return Err(anyhow!("custom storage textures must be 2D"));
+            }
             let Some(storage_format) = map_custom_storage_texture_format(desc.format) else {
                 return Err(anyhow!(
                     "custom texture format {:?} is not supported for storage usage on wgpu",
@@ -1718,13 +1755,15 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             ));
         }
 
+        let width = desc.width.max(1);
+        let height = desc.height.max(1);
         let mip_level_count = desc.data.len().max(1) as u32;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&desc.name),
             size: wgpu::Extent3d {
-                width: desc.width.max(1),
-                height: desc.height.max(1),
-                depth_or_array_layers: 1,
+                width,
+                height,
+                depth_or_array_layers: array_layer_count,
             },
             mip_level_count,
             sample_count: 1,
@@ -1734,15 +1773,19 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             view_formats: &[],
         });
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(view_dimension),
+            ..Default::default()
+        });
 
         let texture_entry = WgpuCustomTexture {
             texture,
             view,
             msaa_texture: None,
             msaa_view: None,
-            width: desc.width.max(1),
-            height: desc.height.max(1),
+            width,
+            height,
+            array_layer_count,
             mip_level_count,
             sample_count: 1,
             format: desc.format,
@@ -1830,6 +1873,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             msaa_view,
             width,
             height,
+            array_layer_count: 1,
             mip_level_count: 1,
             sample_count: desc.sample_count,
             format: desc.format,
@@ -1915,7 +1959,9 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             ));
         }
 
-        let required_bytes = u64::from(upload_bytes_per_row).saturating_mul(u64::from(mip_height));
+        let required_bytes = u64::from(upload_bytes_per_row)
+            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(u64::from(texture_entry.array_layer_count));
 
         let (source_buffer, source_offset, source_size) = {
             let buffers = self.buffers.lock();
@@ -1975,7 +2021,10 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                 label: Some("custom_texture_buffer_upload"),
             });
 
-        if mip_height == 1 {
+        if texture_entry.array_layer_count == 1
+            && mip_height == 1
+            && upload_bytes_per_row == packed_bytes_per_row
+        {
             encoder.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo {
                     buffer: &source_buffer,
@@ -2016,36 +2065,45 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                 wgpu::Extent3d {
                     width: mip_width,
                     height: mip_height,
-                    depth_or_array_layers: 1,
+                    depth_or_array_layers: texture_entry.array_layer_count,
                 },
             );
         } else {
             let row_size = u64::from(upload_bytes_per_row);
-            for row in 0..mip_height {
-                let row_offset = source_offset
-                    .checked_add(u64::from(row).saturating_mul(row_size))
-                    .ok_or_else(|| anyhow!("custom texture buffer row offset overflow"))?;
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &source_buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: row_offset,
-                            bytes_per_row: None,
-                            rows_per_image: None,
+            for layer in 0..texture_entry.array_layer_count {
+                for row in 0..mip_height {
+                    let row_index = u64::from(layer)
+                        .saturating_mul(u64::from(mip_height))
+                        .saturating_add(u64::from(row));
+                    let row_offset = source_offset
+                        .checked_add(row_index.saturating_mul(row_size))
+                        .ok_or_else(|| anyhow!("custom texture buffer row offset overflow"))?;
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &source_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: row_offset,
+                                bytes_per_row: None,
+                                rows_per_image: None,
+                            },
                         },
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture_entry.texture,
-                        mip_level: level,
-                        origin: wgpu::Origin3d { x: 0, y: row, z: 0 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: mip_width,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture_entry.texture,
+                            mip_level: level,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: row,
+                                z: layer,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: mip_width,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
 
@@ -2157,6 +2215,7 @@ fn alloc_slot<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
 fn map_binding_type(
     kind: CustomBindingKind,
     storage_texture_info: Option<WgpuStorageTextureBindingInfo>,
+    sampled_texture_info: Option<WgpuSampledTextureBindingInfo>,
 ) -> Result<wgpu::BindingType> {
     match kind {
         CustomBindingKind::Buffer => Ok(wgpu::BindingType::Buffer {
@@ -2169,11 +2228,19 @@ fn map_binding_type(
             has_dynamic_offset: false,
             min_binding_size: NonZeroU64::new(size as u64),
         }),
-        CustomBindingKind::Texture => Ok(wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        }),
+        CustomBindingKind::Texture => {
+            let sampled_texture_info =
+                sampled_texture_info.unwrap_or(WgpuSampledTextureBindingInfo {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                });
+            Ok(wgpu::BindingType::Texture {
+                sample_type: sampled_texture_info.sample_type,
+                view_dimension: sampled_texture_info.view_dimension,
+                multisampled: sampled_texture_info.multisampled,
+            })
+        }
         CustomBindingKind::Sampler => Ok(wgpu::BindingType::Sampler(
             wgpu::SamplerBindingType::Filtering,
         )),
@@ -2212,6 +2279,23 @@ fn map_custom_storage_texture_format(format: CustomTextureFormat) -> Option<wgpu
         CustomTextureFormat::Rgba8Unorm => Some(wgpu::TextureFormat::Rgba8Unorm),
         CustomTextureFormat::Bgra8Unorm => Some(wgpu::TextureFormat::Bgra8Unorm),
         _ => None,
+    }
+}
+
+fn map_texture_view_dimension(
+    dimension: CustomTextureDimension,
+) -> Result<wgpu::TextureViewDimension> {
+    match dimension {
+        CustomTextureDimension::D2 => Ok(wgpu::TextureViewDimension::D2),
+        CustomTextureDimension::D2Array { layers } => {
+            if layers == 0 {
+                return Err(anyhow!(
+                    "custom texture array layers must be greater than zero"
+                ));
+            }
+            Ok(wgpu::TextureViewDimension::D2Array)
+        }
+        CustomTextureDimension::Cube => Ok(wgpu::TextureViewDimension::Cube),
     }
 }
 
@@ -2309,6 +2393,67 @@ fn map_naga_storage_view_dimension(
             arrayed
         )),
     }
+}
+
+fn map_naga_sampled_view_dimension(
+    dimension: naga::ImageDimension,
+    arrayed: bool,
+) -> Result<wgpu::TextureViewDimension> {
+    match (dimension, arrayed) {
+        (naga::ImageDimension::D1, false) => Ok(wgpu::TextureViewDimension::D1),
+        (naga::ImageDimension::D2, false) => Ok(wgpu::TextureViewDimension::D2),
+        (naga::ImageDimension::D2, true) => Ok(wgpu::TextureViewDimension::D2Array),
+        (naga::ImageDimension::D3, false) => Ok(wgpu::TextureViewDimension::D3),
+        (naga::ImageDimension::Cube, false) => Ok(wgpu::TextureViewDimension::Cube),
+        (naga::ImageDimension::Cube, true) => Ok(wgpu::TextureViewDimension::CubeArray),
+        _ => Err(anyhow!(
+            "custom sampled texture dimension {:?} (arrayed={}) is not supported on wgpu",
+            dimension,
+            arrayed
+        )),
+    }
+}
+
+fn map_naga_sampled_texture_info(
+    class: naga::ImageClass,
+    dimension: naga::ImageDimension,
+    arrayed: bool,
+) -> Result<Option<WgpuSampledTextureBindingInfo>> {
+    let (sample_type, multisampled) = match class {
+        naga::ImageClass::Sampled { kind, multi } => {
+            let sample_type = match kind {
+                naga::ScalarKind::Float => wgpu::TextureSampleType::Float { filterable: true },
+                naga::ScalarKind::Sint => wgpu::TextureSampleType::Sint,
+                naga::ScalarKind::Uint => wgpu::TextureSampleType::Uint,
+                naga::ScalarKind::Bool => {
+                    return Err(anyhow!(
+                        "custom sampled textures cannot use bool sample type"
+                    ));
+                }
+                naga::ScalarKind::AbstractInt | naga::ScalarKind::AbstractFloat => {
+                    return Err(anyhow!(
+                        "custom sampled textures cannot use abstract sample types"
+                    ));
+                }
+            };
+            (sample_type, multi)
+        }
+        naga::ImageClass::Depth { multi } => (wgpu::TextureSampleType::Depth, multi),
+        naga::ImageClass::External => {
+            return Err(anyhow!(
+                "custom external textures are not supported on this wgpu renderer"
+            ));
+        }
+        naga::ImageClass::Storage { .. } => return Ok(None),
+    };
+
+    let view_dimension = map_naga_sampled_view_dimension(dimension, arrayed)?;
+
+    Ok(Some(WgpuSampledTextureBindingInfo {
+        sample_type,
+        view_dimension,
+        multisampled,
+    }))
 }
 
 fn map_filter(filter: CustomFilterMode) -> wgpu::FilterMode {
@@ -2528,6 +2673,63 @@ fn collect_storage_texture_binding_info(
     }
 
     Ok(storage_texture_infos)
+}
+
+fn collect_sampled_texture_binding_info(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    entry_point_index: usize,
+) -> Result<HashMap<(u32, u32), WgpuSampledTextureBindingInfo>> {
+    let entry_info = info.get_entry_point(entry_point_index);
+    let mut sampled_texture_infos = HashMap::new();
+
+    for (handle, variable) in module.global_variables.iter() {
+        if entry_info[handle].is_empty() {
+            continue;
+        }
+
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+
+        let naga::TypeInner::Image {
+            dim,
+            arrayed,
+            class,
+        } = module.types[variable.ty].inner
+        else {
+            continue;
+        };
+
+        let Some(sampled_texture_info) = map_naga_sampled_texture_info(class, dim, arrayed)? else {
+            continue;
+        };
+
+        sampled_texture_infos.insert((binding.group, binding.binding), sampled_texture_info);
+    }
+
+    Ok(sampled_texture_infos)
+}
+
+fn merge_sampled_texture_binding_infos(
+    target: &mut HashMap<(u32, u32), WgpuSampledTextureBindingInfo>,
+    source: HashMap<(u32, u32), WgpuSampledTextureBindingInfo>,
+) -> Result<()> {
+    for (slot, info) in source {
+        if let Some(existing) = target.get(&slot) {
+            if existing != &info {
+                return Err(anyhow!(
+                    "custom sampled texture binding metadata mismatch at @group({}) @binding({})",
+                    slot.0,
+                    slot.1
+                ));
+            }
+            continue;
+        }
+        target.insert(slot, info);
+    }
+
+    Ok(())
 }
 
 fn assign_vertex_locations(
