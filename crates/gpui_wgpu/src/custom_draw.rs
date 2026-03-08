@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use gpui::{
     Bounds, CustomAddressMode, CustomBindingDesc, CustomBindingKind, CustomBindingSlot,
-    CustomBindingValue, CustomBufferDesc, CustomBufferId, CustomBufferSource,
+    CustomBindingValue, CustomBufferDesc, CustomBufferId, CustomBufferSource, CustomCompute,
     CustomComputePipelineDesc, CustomComputePipelineId, CustomCullMode, CustomDepthTargetDesc,
     CustomDepthTargetId, CustomDraw, CustomDrawRegistry, CustomDrawResourceStats, CustomFilterMode,
     CustomFrameDiagnostics, CustomFrontFace, CustomGpuFrameProfile, CustomIndexBuffer,
@@ -32,6 +32,13 @@ struct WgpuCustomPipeline {
 }
 
 #[derive(Clone)]
+struct WgpuCustomComputePipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    bindings: Vec<WgpuBindingSpec>,
+}
+
+#[derive(Clone)]
 struct WgpuCustomBuffer {
     buffer: wgpu::Buffer,
     size: u64,
@@ -52,6 +59,13 @@ struct WgpuCustomTexture {
 struct BindingInfo {
     kind: CustomBindingKind,
     slot: CustomBindingSlot,
+}
+
+#[derive(Clone, Copy)]
+struct WgpuStorageTextureBindingInfo {
+    format: wgpu::TextureFormat,
+    access: wgpu::StorageTextureAccess,
+    view_dimension: wgpu::TextureViewDimension,
 }
 
 enum OwnedBindingResource {
@@ -76,6 +90,7 @@ pub(crate) struct WgpuCustomDrawRegistry {
     queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
     pipelines: Mutex<Vec<Option<WgpuCustomPipeline>>>,
+    compute_pipelines: Mutex<Vec<Option<WgpuCustomComputePipeline>>>,
     buffers: Mutex<Vec<Option<WgpuCustomBuffer>>>,
     textures: Mutex<Vec<Option<WgpuCustomTexture>>>,
     samplers: Mutex<Vec<Option<wgpu::Sampler>>>,
@@ -92,6 +107,7 @@ impl WgpuCustomDrawRegistry {
             queue,
             surface_format,
             pipelines: Mutex::new(Vec::new()),
+            compute_pipelines: Mutex::new(Vec::new()),
             buffers: Mutex::new(Vec::new()),
             textures: Mutex::new(Vec::new()),
             samplers: Mutex::new(Vec::new()),
@@ -222,6 +238,73 @@ impl WgpuCustomDrawRegistry {
             } else {
                 pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
+        }
+    }
+
+    pub(crate) fn dispatch_custom_computes(
+        &self,
+        computes: &[CustomCompute],
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        if computes.is_empty() {
+            return;
+        }
+
+        let compute_pipelines = self.compute_pipelines.lock().clone();
+        let buffers = self.buffers.lock().clone();
+        let textures = self.textures.lock().clone();
+        let samplers = self.samplers.lock().clone();
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("custom_compute_pass"),
+            ..Default::default()
+        });
+
+        let mut temporary_buffers = Vec::new();
+
+        for compute in computes {
+            if compute.workgroup_count.contains(&0) {
+                continue;
+            }
+
+            let pipeline_index = compute.pipeline.0 as usize;
+            let Some(Some(pipeline)) = compute_pipelines.get(pipeline_index) else {
+                log::warn!("missing custom compute pipeline {}", compute.pipeline.0);
+                continue;
+            };
+
+            if compute.bindings.len() != pipeline.bindings.len() {
+                log::warn!(
+                    "custom compute pipeline {} expects {} bindings, got {}",
+                    compute.pipeline.0,
+                    pipeline.bindings.len(),
+                    compute.bindings.len()
+                );
+                continue;
+            }
+
+            let bind_group = match self.create_compute_bind_group(
+                pipeline,
+                &compute.bindings,
+                &buffers,
+                &textures,
+                &samplers,
+                &mut temporary_buffers,
+            ) {
+                Ok(bind_group) => bind_group,
+                Err(error) => {
+                    log::warn!("custom compute bind group creation failed: {error}");
+                    continue;
+                }
+            };
+
+            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                compute.workgroup_count[0],
+                compute.workgroup_count[1],
+                compute.workgroup_count[2],
+            );
         }
     }
 
@@ -434,6 +517,134 @@ impl WgpuCustomDrawRegistry {
 
         Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("custom_draw_bind_group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &bind_group_entries,
+        }))
+    }
+
+    fn create_compute_bind_group(
+        &self,
+        pipeline: &WgpuCustomComputePipeline,
+        binding_values: &[CustomBindingValue],
+        buffers: &[Option<WgpuCustomBuffer>],
+        textures: &[Option<WgpuCustomTexture>],
+        samplers: &[Option<wgpu::Sampler>],
+        temporary_buffers: &mut Vec<wgpu::Buffer>,
+    ) -> Result<wgpu::BindGroup> {
+        let mut owned_resources = Vec::with_capacity(binding_values.len());
+
+        for (binding_spec, binding_value) in pipeline.bindings.iter().zip(binding_values.iter()) {
+            match (binding_spec.kind, binding_value) {
+                (CustomBindingKind::Buffer, CustomBindingValue::Buffer(source)) => {
+                    let resource = self.resolve_buffer_resource(
+                        binding_spec.slot.binding,
+                        source,
+                        buffers,
+                        wgpu::BufferUsages::STORAGE,
+                        temporary_buffers,
+                    )?;
+                    owned_resources.push(resource);
+                }
+                (CustomBindingKind::Uniform { size }, CustomBindingValue::Uniform(source)) => {
+                    let resource = self.resolve_buffer_resource(
+                        binding_spec.slot.binding,
+                        source,
+                        buffers,
+                        wgpu::BufferUsages::UNIFORM,
+                        temporary_buffers,
+                    )?;
+
+                    let OwnedBindingResource::Buffer {
+                        binding,
+                        buffer,
+                        offset,
+                        size: available_size,
+                    } = resource
+                    else {
+                        return Err(anyhow!("expected buffer resource for uniform binding"));
+                    };
+
+                    let Some(required_size) = NonZeroU64::new(size as u64) else {
+                        return Err(anyhow!("uniform binding declared size must be non-zero"));
+                    };
+
+                    let available_size = available_size.map(|value| value.get()).unwrap_or(0);
+                    if available_size < required_size.get() {
+                        return Err(anyhow!(
+                            "uniform binding is smaller than declared size (have {}, need {})",
+                            available_size,
+                            required_size
+                        ));
+                    }
+
+                    owned_resources.push(OwnedBindingResource::Buffer {
+                        binding,
+                        buffer,
+                        offset,
+                        size: Some(required_size),
+                    });
+                }
+                (CustomBindingKind::Texture, CustomBindingValue::Texture(id))
+                | (CustomBindingKind::StorageTexture, CustomBindingValue::Texture(id)) => {
+                    let Some(Some(texture_entry)) = textures.get(id.0 as usize) else {
+                        return Err(anyhow!("custom draw texture {} is missing", id.0));
+                    };
+                    owned_resources.push(OwnedBindingResource::Texture {
+                        binding: binding_spec.slot.binding,
+                        view: texture_entry.view.clone(),
+                    });
+                }
+                (CustomBindingKind::Sampler, CustomBindingValue::Sampler(id)) => {
+                    let Some(Some(sampler)) = samplers.get(id.0 as usize) else {
+                        return Err(anyhow!("custom draw sampler {} is missing", id.0));
+                    };
+                    owned_resources.push(OwnedBindingResource::Sampler {
+                        binding: binding_spec.slot.binding,
+                        sampler: sampler.clone(),
+                    });
+                }
+                (_, value) => {
+                    return Err(anyhow!(
+                        "custom draw binding value {:?} does not match binding kind",
+                        value
+                    ));
+                }
+            }
+        }
+
+        let mut bind_group_entries = Vec::with_capacity(owned_resources.len());
+        for resource in &owned_resources {
+            match resource {
+                OwnedBindingResource::Buffer {
+                    binding,
+                    buffer,
+                    offset,
+                    size,
+                } => bind_group_entries.push(wgpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: *offset,
+                        size: *size,
+                    }),
+                }),
+                OwnedBindingResource::Texture { binding, view } => {
+                    bind_group_entries.push(wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    });
+                }
+                OwnedBindingResource::Sampler { binding, sampler } => {
+                    bind_group_entries.push(wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    });
+                }
+            }
+        }
+
+        Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("custom_compute_bind_group"),
             layout: &pipeline.bind_group_layout,
             entries: &bind_group_entries,
         }))
@@ -687,7 +898,7 @@ impl WgpuCustomDrawRegistry {
             bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: slot.binding,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: map_binding_type(binding.kind)?,
+                ty: map_binding_type(binding.kind, None)?,
                 count: None,
             });
         }
@@ -795,6 +1006,155 @@ impl WgpuCustomDrawRegistry {
             bind_group_layout,
             bindings: binding_specs,
             vertex_fetch_count: desc.vertex_fetches.len(),
+        })
+    }
+
+    fn create_compute_pipeline_impl(
+        &self,
+        desc: CustomComputePipelineDesc,
+    ) -> Result<WgpuCustomComputePipeline> {
+        if desc.push_constants.is_some() {
+            return Err(anyhow!(
+                "custom compute push constants are not yet supported on wgpu"
+            ));
+        }
+
+        for binding in &desc.bindings {
+            let slot = binding.slot.unwrap_or(CustomBindingSlot {
+                group: 0,
+                binding: binding.name.index(),
+            });
+            if slot.group != 0 {
+                return Err(anyhow!(
+                    "custom compute bind groups above group 0 are not yet supported on wgpu"
+                ));
+            }
+            match binding.kind {
+                CustomBindingKind::Buffer
+                | CustomBindingKind::Texture
+                | CustomBindingKind::Sampler
+                | CustomBindingKind::Uniform { .. }
+                | CustomBindingKind::StorageTexture => {}
+                CustomBindingKind::BufferArray { .. }
+                | CustomBindingKind::TextureArray { .. }
+                | CustomBindingKind::StorageTextureArray { .. } => {
+                    return Err(anyhow!(
+                        "custom compute binding arrays are not yet supported on wgpu"
+                    ));
+                }
+            }
+        }
+
+        let mut module = naga::front::wgsl::parse_str(&desc.shader_source)
+            .map_err(|error| anyhow!("custom compute WGSL parse failed: {error}"))?;
+        let validator_flags =
+            naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+        let mut info =
+            naga::valid::Validator::new(validator_flags, naga::valid::Capabilities::empty())
+                .validate(&module)
+                .map_err(|error| anyhow!("custom compute WGSL validation failed: {error}"))?;
+
+        let compute_entry_index = module
+            .entry_points
+            .iter()
+            .position(|entry| {
+                entry.stage == naga::ShaderStage::Compute && entry.name == desc.entry_point
+            })
+            .ok_or_else(|| anyhow!("custom compute entry '{}' not found", desc.entry_point))?;
+
+        let (bindings_by_name, bindings_by_slot) = build_binding_maps(&desc.bindings);
+        let compute_entry_name = module.entry_points[compute_entry_index].name.clone();
+
+        assign_resource_bindings(
+            &mut module,
+            &info,
+            &compute_entry_name,
+            compute_entry_index,
+            &bindings_by_name,
+            &bindings_by_slot,
+        )?;
+
+        info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .map_err(|error| anyhow!("custom compute WGSL validation failed: {error}"))?;
+
+        let storage_texture_infos =
+            collect_storage_texture_binding_info(&module, &info, compute_entry_index)?;
+
+        let rewritten_wgsl =
+            naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+                .map_err(|error| anyhow!("custom compute WGSL rewrite failed: {error}"))?;
+
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("custom_compute_shader"),
+                source: wgpu::ShaderSource::Wgsl(rewritten_wgsl.into()),
+            });
+
+        let mut binding_specs = Vec::with_capacity(desc.bindings.len());
+        let mut bind_group_layout_entries = Vec::with_capacity(desc.bindings.len());
+
+        for binding in &desc.bindings {
+            let slot = binding.slot.unwrap_or(CustomBindingSlot {
+                group: 0,
+                binding: binding.name.index(),
+            });
+            binding_specs.push(WgpuBindingSpec {
+                kind: binding.kind,
+                slot,
+            });
+
+            let binding_type = map_binding_type(
+                binding.kind,
+                storage_texture_infos
+                    .get(&(slot.group, slot.binding))
+                    .copied(),
+            )?;
+
+            bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: slot.binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: binding_type,
+                count: None,
+            });
+        }
+
+        bind_group_layout_entries.sort_by_key(|entry| entry.binding);
+
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("custom_compute_bind_group_layout"),
+                    entries: &bind_group_layout_entries,
+                });
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("custom_compute_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                immediate_size: 0,
+            });
+
+        let compute_pipeline =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(&desc.name),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_module,
+                    entry_point: Some(&desc.entry_point),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        Ok(WgpuCustomComputePipeline {
+            pipeline: compute_pipeline,
+            bind_group_layout,
+            bindings: binding_specs,
         })
     }
 
@@ -948,6 +1308,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
 
     fn resource_stats(&self) -> CustomDrawResourceStats {
         let pipelines = self.pipelines.lock();
+        let compute_pipelines = self.compute_pipelines.lock();
         let buffers = self.buffers.lock();
         let textures = self.textures.lock();
         let samplers = self.samplers.lock();
@@ -970,7 +1331,10 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
 
         CustomDrawResourceStats {
             pipeline_count: pipelines.iter().filter(|entry| entry.is_some()).count() as u32,
-            compute_pipeline_count: 0,
+            compute_pipeline_count: compute_pipelines
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count() as u32,
             buffer_count: buffers.iter().filter(|entry| entry.is_some()).count() as u32,
             buffer_bytes,
             texture_count: textures.iter().filter(|entry| entry.is_some()).count() as u32,
@@ -988,11 +1352,12 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
 
     fn create_compute_pipeline(
         &self,
-        _desc: CustomComputePipelineDesc,
+        desc: CustomComputePipelineDesc,
     ) -> Result<CustomComputePipelineId> {
-        Err(anyhow!(
-            "custom draw compute pipelines are not yet supported on wgpu"
-        ))
+        let pipeline = self.create_compute_pipeline_impl(desc)?;
+        let mut compute_pipelines = self.compute_pipelines.lock();
+        let pipeline_id = alloc_slot(&mut compute_pipelines, pipeline);
+        Ok(CustomComputePipelineId(pipeline_id))
     }
 
     fn create_buffer(&self, desc: CustomBufferDesc) -> Result<CustomBufferId> {
@@ -1034,11 +1399,6 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                 "custom texture arrays and cubemaps are not yet supported on wgpu"
             ));
         }
-        if desc.usage.contains(CustomTextureUsage::STORAGE) {
-            return Err(anyhow!(
-                "custom storage textures are not yet supported on wgpu"
-            ));
-        }
         if desc.format.is_compressed() {
             return Err(anyhow!(
                 "compressed custom textures are not yet supported on wgpu"
@@ -1052,6 +1412,31 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             ));
         };
 
+        let mut texture_usage = wgpu::TextureUsages::COPY_DST;
+        if desc.usage.contains(CustomTextureUsage::SAMPLED) {
+            texture_usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+        }
+        if desc.usage.contains(CustomTextureUsage::STORAGE) {
+            let Some(storage_format) = map_custom_storage_texture_format(desc.format) else {
+                return Err(anyhow!(
+                    "custom texture format {:?} is not supported for storage usage on wgpu",
+                    desc.format
+                ));
+            };
+            if storage_format != texture_format {
+                return Err(anyhow!(
+                    "custom texture format {:?} cannot be used as a storage texture on wgpu",
+                    desc.format
+                ));
+            }
+            texture_usage |= wgpu::TextureUsages::STORAGE_BINDING;
+        }
+        if texture_usage == wgpu::TextureUsages::COPY_DST {
+            return Err(anyhow!(
+                "custom texture usage must include sampled and/or storage usage"
+            ));
+        }
+
         let mip_level_count = desc.data.len().max(1) as u32;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&desc.name),
@@ -1064,7 +1449,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: texture_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: texture_usage,
             view_formats: &[],
         });
 
@@ -1173,7 +1558,10 @@ fn alloc_slot<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
     slot_index
 }
 
-fn map_binding_type(kind: CustomBindingKind) -> Result<wgpu::BindingType> {
+fn map_binding_type(
+    kind: CustomBindingKind,
+    storage_texture_info: Option<WgpuStorageTextureBindingInfo>,
+) -> Result<wgpu::BindingType> {
     match kind {
         CustomBindingKind::Buffer => Ok(wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -1193,9 +1581,18 @@ fn map_binding_type(kind: CustomBindingKind) -> Result<wgpu::BindingType> {
         CustomBindingKind::Sampler => Ok(wgpu::BindingType::Sampler(
             wgpu::SamplerBindingType::Filtering,
         )),
-        CustomBindingKind::StorageTexture => Err(anyhow!(
-            "custom draw storage textures are not yet supported on wgpu"
-        )),
+        CustomBindingKind::StorageTexture => {
+            let Some(storage_texture_info) = storage_texture_info else {
+                return Err(anyhow!(
+                    "custom storage texture binding metadata is missing"
+                ));
+            };
+            Ok(wgpu::BindingType::StorageTexture {
+                access: storage_texture_info.access,
+                format: storage_texture_info.format,
+                view_dimension: storage_texture_info.view_dimension,
+            })
+        }
         CustomBindingKind::BufferArray { .. }
         | CustomBindingKind::TextureArray { .. }
         | CustomBindingKind::StorageTextureArray { .. } => Err(anyhow!(
@@ -1211,6 +1608,94 @@ fn map_texture_format(format: CustomTextureFormat) -> Option<wgpu::TextureFormat
         CustomTextureFormat::Rgba8UnormSrgb => Some(wgpu::TextureFormat::Rgba8UnormSrgb),
         CustomTextureFormat::Bgra8UnormSrgb => Some(wgpu::TextureFormat::Bgra8UnormSrgb),
         _ => None,
+    }
+}
+
+fn map_custom_storage_texture_format(format: CustomTextureFormat) -> Option<wgpu::TextureFormat> {
+    match format {
+        CustomTextureFormat::Rgba8Unorm => Some(wgpu::TextureFormat::Rgba8Unorm),
+        CustomTextureFormat::Bgra8Unorm => Some(wgpu::TextureFormat::Bgra8Unorm),
+        _ => None,
+    }
+}
+
+fn map_naga_storage_format(format: naga::StorageFormat) -> Result<wgpu::TextureFormat> {
+    match format {
+        naga::StorageFormat::R8Unorm => Ok(wgpu::TextureFormat::R8Unorm),
+        naga::StorageFormat::R8Snorm => Ok(wgpu::TextureFormat::R8Snorm),
+        naga::StorageFormat::R8Uint => Ok(wgpu::TextureFormat::R8Uint),
+        naga::StorageFormat::R8Sint => Ok(wgpu::TextureFormat::R8Sint),
+        naga::StorageFormat::R16Uint => Ok(wgpu::TextureFormat::R16Uint),
+        naga::StorageFormat::R16Sint => Ok(wgpu::TextureFormat::R16Sint),
+        naga::StorageFormat::R16Float => Ok(wgpu::TextureFormat::R16Float),
+        naga::StorageFormat::Rg8Unorm => Ok(wgpu::TextureFormat::Rg8Unorm),
+        naga::StorageFormat::Rg8Snorm => Ok(wgpu::TextureFormat::Rg8Snorm),
+        naga::StorageFormat::Rg8Uint => Ok(wgpu::TextureFormat::Rg8Uint),
+        naga::StorageFormat::Rg8Sint => Ok(wgpu::TextureFormat::Rg8Sint),
+        naga::StorageFormat::R32Uint => Ok(wgpu::TextureFormat::R32Uint),
+        naga::StorageFormat::R32Sint => Ok(wgpu::TextureFormat::R32Sint),
+        naga::StorageFormat::R32Float => Ok(wgpu::TextureFormat::R32Float),
+        naga::StorageFormat::Rg16Uint => Ok(wgpu::TextureFormat::Rg16Uint),
+        naga::StorageFormat::Rg16Sint => Ok(wgpu::TextureFormat::Rg16Sint),
+        naga::StorageFormat::Rg16Float => Ok(wgpu::TextureFormat::Rg16Float),
+        naga::StorageFormat::Rgba8Unorm => Ok(wgpu::TextureFormat::Rgba8Unorm),
+        naga::StorageFormat::Rgba8Snorm => Ok(wgpu::TextureFormat::Rgba8Snorm),
+        naga::StorageFormat::Rgba8Uint => Ok(wgpu::TextureFormat::Rgba8Uint),
+        naga::StorageFormat::Rgba8Sint => Ok(wgpu::TextureFormat::Rgba8Sint),
+        naga::StorageFormat::Bgra8Unorm => Ok(wgpu::TextureFormat::Bgra8Unorm),
+        naga::StorageFormat::Rgb10a2Uint => Ok(wgpu::TextureFormat::Rgb10a2Uint),
+        naga::StorageFormat::Rgb10a2Unorm => Ok(wgpu::TextureFormat::Rgb10a2Unorm),
+        naga::StorageFormat::Rg11b10Ufloat => Ok(wgpu::TextureFormat::Rg11b10Ufloat),
+        naga::StorageFormat::Rg32Uint => Ok(wgpu::TextureFormat::Rg32Uint),
+        naga::StorageFormat::Rg32Sint => Ok(wgpu::TextureFormat::Rg32Sint),
+        naga::StorageFormat::Rg32Float => Ok(wgpu::TextureFormat::Rg32Float),
+        naga::StorageFormat::Rgba16Uint => Ok(wgpu::TextureFormat::Rgba16Uint),
+        naga::StorageFormat::Rgba16Sint => Ok(wgpu::TextureFormat::Rgba16Sint),
+        naga::StorageFormat::Rgba16Float => Ok(wgpu::TextureFormat::Rgba16Float),
+        naga::StorageFormat::Rgba32Uint => Ok(wgpu::TextureFormat::Rgba32Uint),
+        naga::StorageFormat::Rgba32Sint => Ok(wgpu::TextureFormat::Rgba32Sint),
+        naga::StorageFormat::Rgba32Float => Ok(wgpu::TextureFormat::Rgba32Float),
+        naga::StorageFormat::R16Unorm => Ok(wgpu::TextureFormat::R16Unorm),
+        naga::StorageFormat::R16Snorm => Ok(wgpu::TextureFormat::R16Snorm),
+        naga::StorageFormat::Rg16Unorm => Ok(wgpu::TextureFormat::Rg16Unorm),
+        naga::StorageFormat::Rg16Snorm => Ok(wgpu::TextureFormat::Rg16Snorm),
+        naga::StorageFormat::Rgba16Unorm => Ok(wgpu::TextureFormat::Rgba16Unorm),
+        naga::StorageFormat::Rgba16Snorm => Ok(wgpu::TextureFormat::Rgba16Snorm),
+        unsupported => Err(anyhow!(
+            "custom storage texture format {:?} is not supported on this wgpu renderer",
+            unsupported
+        )),
+    }
+}
+
+fn map_naga_storage_access(access: naga::StorageAccess) -> Result<wgpu::StorageTextureAccess> {
+    let has_load = access.contains(naga::StorageAccess::LOAD);
+    let has_store = access.contains(naga::StorageAccess::STORE);
+
+    match (has_load, has_store) {
+        (true, true) => Ok(wgpu::StorageTextureAccess::ReadWrite),
+        (true, false) => Ok(wgpu::StorageTextureAccess::ReadOnly),
+        (false, true) => Ok(wgpu::StorageTextureAccess::WriteOnly),
+        (false, false) => Err(anyhow!(
+            "custom storage texture binding must allow load and/or store access"
+        )),
+    }
+}
+
+fn map_naga_storage_view_dimension(
+    dimension: naga::ImageDimension,
+    arrayed: bool,
+) -> Result<wgpu::TextureViewDimension> {
+    match (dimension, arrayed) {
+        (naga::ImageDimension::D1, false) => Ok(wgpu::TextureViewDimension::D1),
+        (naga::ImageDimension::D2, false) => Ok(wgpu::TextureViewDimension::D2),
+        (naga::ImageDimension::D2, true) => Ok(wgpu::TextureViewDimension::D2Array),
+        (naga::ImageDimension::D3, false) => Ok(wgpu::TextureViewDimension::D3),
+        _ => Err(anyhow!(
+            "custom storage texture dimension {:?} (arrayed={}) is not supported on wgpu",
+            dimension,
+            arrayed
+        )),
     }
 }
 
@@ -1381,6 +1866,49 @@ fn build_binding_maps(
     }
 
     (by_name, by_slot)
+}
+
+fn collect_storage_texture_binding_info(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    entry_point_index: usize,
+) -> Result<HashMap<(u32, u32), WgpuStorageTextureBindingInfo>> {
+    let entry_info = info.get_entry_point(entry_point_index);
+    let mut storage_texture_infos = HashMap::new();
+
+    for (handle, variable) in module.global_variables.iter() {
+        if entry_info[handle].is_empty() {
+            continue;
+        }
+
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+
+        let naga::TypeInner::Image {
+            dim,
+            arrayed,
+            class: naga::ImageClass::Storage { format, access },
+        } = module.types[variable.ty].inner
+        else {
+            continue;
+        };
+
+        let format = map_naga_storage_format(format)?;
+        let view_dimension = map_naga_storage_view_dimension(dim, arrayed)?;
+        let access = map_naga_storage_access(access)?;
+
+        storage_texture_infos.insert(
+            (binding.group, binding.binding),
+            WgpuStorageTextureBindingInfo {
+                format,
+                access,
+                view_dimension,
+            },
+        );
+    }
+
+    Ok(storage_texture_infos)
 }
 
 fn assign_vertex_locations(
@@ -1591,11 +2119,17 @@ fn validate_binding_kind(
                 entry_point_name
             )),
         },
-        CustomBindingKind::StorageTexture => Err(anyhow!(
-            "binding '{}' in entry '{}' uses storage textures, which are not yet supported on wgpu",
-            variable_name,
-            entry_point_name
-        )),
+        CustomBindingKind::StorageTexture => match module.types[variable.ty].inner {
+            naga::TypeInner::Image {
+                class: naga::ImageClass::Storage { .. },
+                ..
+            } => Ok(()),
+            _ => Err(anyhow!(
+                "binding '{}' in entry '{}' must be a storage texture",
+                variable_name,
+                entry_point_name
+            )),
+        },
         CustomBindingKind::BufferArray { .. }
         | CustomBindingKind::TextureArray { .. }
         | CustomBindingKind::StorageTextureArray { .. } => Err(anyhow!(

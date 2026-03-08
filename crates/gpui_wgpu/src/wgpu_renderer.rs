@@ -1145,6 +1145,9 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
+            self.custom_draw
+                .dispatch_custom_computes(&scene.custom_computes, &mut encoder);
+
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
