@@ -13,7 +13,7 @@ use gpui::{
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -95,6 +95,12 @@ struct WgpuSampledTextureBindingInfo {
     multisampled: bool,
 }
 
+struct OwnedBufferArrayElement {
+    buffer: wgpu::Buffer,
+    offset: u64,
+    size: Option<NonZeroU64>,
+}
+
 enum OwnedBindingResource {
     Buffer {
         binding: u32,
@@ -102,9 +108,17 @@ enum OwnedBindingResource {
         offset: u64,
         size: Option<NonZeroU64>,
     },
+    BufferArray {
+        binding: u32,
+        elements: Vec<OwnedBufferArrayElement>,
+    },
     Texture {
         binding: u32,
         view: wgpu::TextureView,
+    },
+    TextureArray {
+        binding: u32,
+        views: Vec<wgpu::TextureView>,
     },
     Sampler {
         binding: u32,
@@ -760,6 +774,48 @@ impl WgpuCustomDrawRegistry {
                     )?;
                     owned_resources.push(resource);
                 }
+                (
+                    CustomBindingKind::BufferArray { count },
+                    CustomBindingValue::BufferArray(sources),
+                ) => {
+                    if sources.len() != count as usize {
+                        return Err(anyhow!(
+                            "custom draw buffer binding array length mismatch (expected {}, got {})",
+                            count,
+                            sources.len()
+                        ));
+                    }
+
+                    let mut elements = Vec::with_capacity(sources.len());
+                    for source in sources {
+                        let resource = self.resolve_buffer_resource(
+                            binding_spec.slot.binding,
+                            source,
+                            buffers,
+                            wgpu::BufferUsages::STORAGE,
+                            temporary_buffers,
+                        )?;
+                        let OwnedBindingResource::Buffer {
+                            buffer,
+                            offset,
+                            size,
+                            ..
+                        } = resource
+                        else {
+                            return Err(anyhow!("expected buffer resource for buffer array"));
+                        };
+                        elements.push(OwnedBufferArrayElement {
+                            buffer,
+                            offset,
+                            size,
+                        });
+                    }
+
+                    owned_resources.push(OwnedBindingResource::BufferArray {
+                        binding: binding_spec.slot.binding,
+                        elements,
+                    });
+                }
                 (CustomBindingKind::Uniform { size }, CustomBindingValue::Uniform(source)) => {
                     let resource = self.resolve_buffer_resource(
                         binding_spec.slot.binding,
@@ -809,6 +865,32 @@ impl WgpuCustomDrawRegistry {
                         view: texture_entry.view.clone(),
                     });
                 }
+                (
+                    CustomBindingKind::TextureArray { count }
+                    | CustomBindingKind::StorageTextureArray { count },
+                    CustomBindingValue::TextureArray(ids),
+                ) => {
+                    if ids.len() != count as usize {
+                        return Err(anyhow!(
+                            "custom draw texture binding array length mismatch (expected {}, got {})",
+                            count,
+                            ids.len()
+                        ));
+                    }
+
+                    let mut views = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        let Some(Some(texture_entry)) = textures.get(id.0 as usize) else {
+                            return Err(anyhow!("custom draw texture {} is missing", id.0));
+                        };
+                        views.push(texture_entry.view.clone());
+                    }
+
+                    owned_resources.push(OwnedBindingResource::TextureArray {
+                        binding: binding_spec.slot.binding,
+                        views,
+                    });
+                }
                 (CustomBindingKind::Sampler, CustomBindingValue::Sampler(id)) => {
                     let Some(Some(sampler)) = samplers.get(id.0 as usize) else {
                         return Err(anyhow!("custom draw sampler {} is missing", id.0));
@@ -832,9 +914,34 @@ impl WgpuCustomDrawRegistry {
         for (group, mut owned_resources) in owned_resources_by_group {
             owned_resources.sort_by_key(|resource| match resource {
                 OwnedBindingResource::Buffer { binding, .. }
+                | OwnedBindingResource::BufferArray { binding, .. }
                 | OwnedBindingResource::Texture { binding, .. }
+                | OwnedBindingResource::TextureArray { binding, .. }
                 | OwnedBindingResource::Sampler { binding, .. } => *binding,
             });
+
+            let mut buffer_array_entries_by_binding = BTreeMap::new();
+            let mut texture_array_entries_by_binding = BTreeMap::new();
+            for resource in &owned_resources {
+                match resource {
+                    OwnedBindingResource::BufferArray { binding, elements } => {
+                        let array: Vec<wgpu::BufferBinding<'_>> = elements
+                            .iter()
+                            .map(|element| wgpu::BufferBinding {
+                                buffer: &element.buffer,
+                                offset: element.offset,
+                                size: element.size,
+                            })
+                            .collect();
+                        buffer_array_entries_by_binding.insert(*binding, array);
+                    }
+                    OwnedBindingResource::TextureArray { binding, views } => {
+                        let array: Vec<&wgpu::TextureView> = views.iter().collect();
+                        texture_array_entries_by_binding.insert(*binding, array);
+                    }
+                    _ => {}
+                }
+            }
 
             let mut bind_group_entries = Vec::with_capacity(owned_resources.len());
             for resource in &owned_resources {
@@ -852,10 +959,34 @@ impl WgpuCustomDrawRegistry {
                             size: *size,
                         }),
                     }),
+                    OwnedBindingResource::BufferArray { binding, .. } => {
+                        let Some(array) = buffer_array_entries_by_binding.get(binding) else {
+                            return Err(anyhow!(
+                                "custom draw buffer binding array {} is missing",
+                                binding
+                            ));
+                        };
+                        bind_group_entries.push(wgpu::BindGroupEntry {
+                            binding: *binding,
+                            resource: wgpu::BindingResource::BufferArray(array.as_slice()),
+                        });
+                    }
                     OwnedBindingResource::Texture { binding, view } => {
                         bind_group_entries.push(wgpu::BindGroupEntry {
                             binding: *binding,
                             resource: wgpu::BindingResource::TextureView(view),
+                        });
+                    }
+                    OwnedBindingResource::TextureArray { binding, .. } => {
+                        let Some(array) = texture_array_entries_by_binding.get(binding) else {
+                            return Err(anyhow!(
+                                "custom draw texture binding array {} is missing",
+                                binding
+                            ));
+                        };
+                        bind_group_entries.push(wgpu::BindGroupEntry {
+                            binding: *binding,
+                            resource: wgpu::BindingResource::TextureViewArray(array.as_slice()),
                         });
                     }
                     OwnedBindingResource::Sampler { binding, sampler } => {
@@ -1008,24 +1139,30 @@ impl WgpuCustomDrawRegistry {
             ));
         }
 
+        let device_features = self.device.features();
         for binding in &desc.bindings {
             match binding.kind {
                 CustomBindingKind::Buffer
+                | CustomBindingKind::BufferArray { .. }
                 | CustomBindingKind::Texture
+                | CustomBindingKind::TextureArray { .. }
                 | CustomBindingKind::Sampler
                 | CustomBindingKind::Uniform { .. } => {}
-                CustomBindingKind::BufferArray { .. }
-                | CustomBindingKind::TextureArray { .. }
+                CustomBindingKind::StorageTexture
                 | CustomBindingKind::StorageTextureArray { .. } => {
-                    return Err(anyhow!(
-                        "custom draw binding arrays are not yet supported on wgpu"
-                    ));
-                }
-                CustomBindingKind::StorageTexture => {
                     return Err(anyhow!(
                         "custom draw storage textures are not yet supported on wgpu"
                     ));
                 }
+            }
+
+            let required_features = binding_kind_required_features(binding.kind);
+            if !device_features.contains(required_features) {
+                return Err(anyhow!(
+                    "custom draw binding {:?} requires unsupported wgpu features: {:?}",
+                    binding.kind,
+                    required_features
+                ));
             }
         }
 
@@ -1138,7 +1275,7 @@ impl WgpuCustomDrawRegistry {
                             .get(&(slot.group, slot.binding))
                             .copied(),
                     )?,
-                    count: None,
+                    count: binding_array_count(binding.kind),
                 },
             );
         }
@@ -1297,20 +1434,26 @@ impl WgpuCustomDrawRegistry {
             ));
         }
 
+        let device_features = self.device.features();
         for binding in &desc.bindings {
             match binding.kind {
                 CustomBindingKind::Buffer
+                | CustomBindingKind::BufferArray { .. }
                 | CustomBindingKind::Texture
+                | CustomBindingKind::TextureArray { .. }
                 | CustomBindingKind::Sampler
                 | CustomBindingKind::Uniform { .. }
-                | CustomBindingKind::StorageTexture => {}
-                CustomBindingKind::BufferArray { .. }
-                | CustomBindingKind::TextureArray { .. }
-                | CustomBindingKind::StorageTextureArray { .. } => {
-                    return Err(anyhow!(
-                        "custom compute binding arrays are not yet supported on wgpu"
-                    ));
-                }
+                | CustomBindingKind::StorageTexture
+                | CustomBindingKind::StorageTextureArray { .. } => {}
+            }
+
+            let required_features = binding_kind_required_features(binding.kind);
+            if !device_features.contains(required_features) {
+                return Err(anyhow!(
+                    "custom compute binding {:?} requires unsupported wgpu features: {:?}",
+                    binding.kind,
+                    required_features
+                ));
             }
         }
 
@@ -1399,7 +1542,7 @@ impl WgpuCustomDrawRegistry {
                     binding: slot.binding,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: binding_type,
-                    count: None,
+                    count: binding_array_count(binding.kind),
                 },
             );
         }
@@ -2263,11 +2406,58 @@ fn map_binding_type(
                 view_dimension: storage_texture_info.view_dimension,
             })
         }
-        CustomBindingKind::BufferArray { .. }
-        | CustomBindingKind::TextureArray { .. }
-        | CustomBindingKind::StorageTextureArray { .. } => Err(anyhow!(
-            "custom draw binding arrays are not yet supported on wgpu"
-        )),
+        CustomBindingKind::BufferArray { .. } => Ok(wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        }),
+        CustomBindingKind::TextureArray { .. } => {
+            let sampled_texture_info =
+                sampled_texture_info.unwrap_or(WgpuSampledTextureBindingInfo {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                });
+            Ok(wgpu::BindingType::Texture {
+                sample_type: sampled_texture_info.sample_type,
+                view_dimension: sampled_texture_info.view_dimension,
+                multisampled: sampled_texture_info.multisampled,
+            })
+        }
+        CustomBindingKind::StorageTextureArray { .. } => {
+            let Some(storage_texture_info) = storage_texture_info else {
+                return Err(anyhow!(
+                    "custom storage texture binding metadata is missing"
+                ));
+            };
+            Ok(wgpu::BindingType::StorageTexture {
+                access: storage_texture_info.access,
+                format: storage_texture_info.format,
+                view_dimension: storage_texture_info.view_dimension,
+            })
+        }
+    }
+}
+
+fn binding_array_count(kind: CustomBindingKind) -> Option<NonZeroU32> {
+    match kind {
+        CustomBindingKind::BufferArray { count }
+        | CustomBindingKind::TextureArray { count }
+        | CustomBindingKind::StorageTextureArray { count } => NonZeroU32::new(count),
+        _ => None,
+    }
+}
+
+fn binding_kind_required_features(kind: CustomBindingKind) -> wgpu::Features {
+    match kind {
+        CustomBindingKind::BufferArray { .. } => {
+            wgpu::Features::BUFFER_BINDING_ARRAY | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        }
+        CustomBindingKind::TextureArray { .. } => wgpu::Features::TEXTURE_BINDING_ARRAY,
+        CustomBindingKind::StorageTextureArray { .. } => {
+            wgpu::Features::TEXTURE_BINDING_ARRAY | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        }
+        _ => wgpu::Features::empty(),
     }
 }
 
@@ -2712,12 +2902,24 @@ fn collect_storage_texture_binding_info(
             continue;
         };
 
-        let naga::TypeInner::Image {
-            dim,
-            arrayed,
-            class: naga::ImageClass::Storage { format, access },
-        } = module.types[variable.ty].inner
-        else {
+        let image = match module.types[variable.ty].inner {
+            naga::TypeInner::Image {
+                dim,
+                arrayed,
+                class,
+            } => Some((dim, arrayed, class)),
+            naga::TypeInner::BindingArray { base, .. } => match module.types[base].inner {
+                naga::TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                } => Some((dim, arrayed, class)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let Some((dim, arrayed, naga::ImageClass::Storage { format, access })) = image else {
             continue;
         };
 
@@ -2755,12 +2957,24 @@ fn collect_sampled_texture_binding_info(
             continue;
         };
 
-        let naga::TypeInner::Image {
-            dim,
-            arrayed,
-            class,
-        } = module.types[variable.ty].inner
-        else {
+        let image = match module.types[variable.ty].inner {
+            naga::TypeInner::Image {
+                dim,
+                arrayed,
+                class,
+            } => Some((dim, arrayed, class)),
+            naga::TypeInner::BindingArray { base, .. } => match module.types[base].inner {
+                naga::TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                } => Some((dim, arrayed, class)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let Some((dim, arrayed, class)) = image else {
             continue;
         };
 
@@ -2951,6 +3165,66 @@ fn validate_binding_kind(
     variable_name: &str,
 ) -> Result<()> {
     match binding_kind {
+        CustomBindingKind::BufferArray { count } => match module.types[variable.ty].inner {
+            naga::TypeInner::BindingArray { size, .. } => {
+                validate_binding_array_size(size, count, entry_point_name, variable_name)?;
+                match variable.space {
+                    naga::AddressSpace::Storage { .. } => Ok(()),
+                    _ => Err(anyhow!(
+                        "binding '{}' in entry '{}' must be a storage buffer array",
+                        variable_name,
+                        entry_point_name
+                    )),
+                }
+            }
+            _ => Err(anyhow!(
+                "binding '{}' in entry '{}' must be a storage buffer array",
+                variable_name,
+                entry_point_name
+            )),
+        },
+        CustomBindingKind::TextureArray { count } => match module.types[variable.ty].inner {
+            naga::TypeInner::BindingArray { base, size } => match module.types[base].inner {
+                naga::TypeInner::Image {
+                    class: naga::ImageClass::Sampled { .. },
+                    ..
+                } => {
+                    validate_binding_array_size(size, count, entry_point_name, variable_name)?;
+                    Ok(())
+                }
+                _ => Err(anyhow!(
+                    "binding '{}' in entry '{}' must be a sampled texture array",
+                    variable_name,
+                    entry_point_name
+                )),
+            },
+            _ => Err(anyhow!(
+                "binding '{}' in entry '{}' must be a sampled texture array",
+                variable_name,
+                entry_point_name
+            )),
+        },
+        CustomBindingKind::StorageTextureArray { count } => match module.types[variable.ty].inner {
+            naga::TypeInner::BindingArray { base, size } => match module.types[base].inner {
+                naga::TypeInner::Image {
+                    class: naga::ImageClass::Storage { .. },
+                    ..
+                } => {
+                    validate_binding_array_size(size, count, entry_point_name, variable_name)?;
+                    Ok(())
+                }
+                _ => Err(anyhow!(
+                    "binding '{}' in entry '{}' must be a storage texture array",
+                    variable_name,
+                    entry_point_name
+                )),
+            },
+            _ => Err(anyhow!(
+                "binding '{}' in entry '{}' must be a storage texture array",
+                variable_name,
+                entry_point_name
+            )),
+        },
         CustomBindingKind::Texture => match module.types[variable.ty].inner {
             naga::TypeInner::Image {
                 class: naga::ImageClass::Sampled { .. },
@@ -3014,12 +3288,41 @@ fn validate_binding_kind(
                 entry_point_name
             )),
         },
-        CustomBindingKind::BufferArray { .. }
-        | CustomBindingKind::TextureArray { .. }
-        | CustomBindingKind::StorageTextureArray { .. } => Err(anyhow!(
-            "binding '{}' in entry '{}' uses binding arrays, which are not yet supported on wgpu",
-            variable_name,
-            entry_point_name
-        )),
     }
+}
+
+fn validate_binding_array_size(
+    size: naga::ArraySize,
+    expected: u32,
+    entry_point_name: &str,
+    variable_name: &str,
+) -> Result<()> {
+    let actual = match size {
+        naga::ArraySize::Constant(size) => size.get(),
+        naga::ArraySize::Pending(_) => {
+            return Err(anyhow!(
+                "binding '{}' in entry '{}' must use a constant binding array length",
+                variable_name,
+                entry_point_name
+            ));
+        }
+        naga::ArraySize::Dynamic => {
+            return Err(anyhow!(
+                "binding '{}' in entry '{}' must not use a runtime-sized binding array",
+                variable_name,
+                entry_point_name
+            ));
+        }
+    };
+
+    if actual != expected {
+        return Err(anyhow!(
+            "binding '{}' array length mismatch (expected {}, shader reports {})",
+            variable_name,
+            expected,
+            actual
+        ));
+    }
+
+    Ok(())
 }

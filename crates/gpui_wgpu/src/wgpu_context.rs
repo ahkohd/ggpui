@@ -137,6 +137,11 @@ impl WgpuContext {
             wgpu::Features::TEXTURE_COMPRESSION_ETC2,
             wgpu::Features::TEXTURE_COMPRESSION_ASTC,
             wgpu::Features::BGRA8UNORM_STORAGE,
+            wgpu::Features::TEXTURE_BINDING_ARRAY,
+            wgpu::Features::BUFFER_BINDING_ARRAY,
+            wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
+            wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+            wgpu::Features::STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING,
         ] {
             if adapter_features.contains(optional_feature) {
                 required_features |= optional_feature;
