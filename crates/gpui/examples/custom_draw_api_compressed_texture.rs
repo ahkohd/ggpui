@@ -16,48 +16,55 @@ use gpui::{
 use gpui_platform::application;
 
 const SHADER_SOURCE: &str = r#"
- struct VertexInput {
-   a0: vec2<f32>,
-   a1: vec2<f32>,
- };
+struct VertexInput {
+  a0: vec2<f32>,
+  a1: vec2<f32>,
+};
 
- struct VertexOutput {
-   @builtin(position) position: vec4<f32>,
-   @location(0) uv: vec2<f32>,
- };
+struct VertexOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
 
- var b0: texture_2d<f32>;
- var b1: sampler;
+var b0: texture_2d<f32>;
+var b1: sampler;
 
- @vertex
- fn vs_main(input: VertexInput) -> VertexOutput {
-   var out: VertexOutput;
-   out.position = vec4<f32>(input.a0, 0.0, 1.0);
-   out.uv = input.a1;
-   return out;
- }
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+  var out: VertexOutput;
+  out.position = vec4<f32>(input.a0, 0.0, 1.0);
+  out.uv = input.a1;
+  return out;
+}
 
- @fragment
- fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-   return textureSample(b0, b1, input.uv);
- }
- "#;
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+  return textureSample(b0, b1, input.uv);
+}
+"#;
 
-struct CustomDrawExample {
+const BC1_RED_BLOCK: [u8; 8] = [0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const BC1_GREEN_BLOCK: [u8; 8] = [0xE0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const TEXTURE_WIDTH: u32 = 16;
+const TEXTURE_HEIGHT: u32 = 8;
+
+struct CompressedTextureExample {
     pipeline: Option<CustomPipelineId>,
     vertex_buffer: Option<CustomBufferId>,
     texture: Option<CustomTextureId>,
     sampler: Option<CustomSamplerId>,
+    format_label: Option<&'static str>,
     error: Option<String>,
 }
 
-impl CustomDrawExample {
+impl CompressedTextureExample {
     fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             pipeline: None,
             vertex_buffer: None,
             texture: None,
             sampler: None,
+            format_label: None,
             error: None,
         }
     }
@@ -68,11 +75,12 @@ impl CustomDrawExample {
         }
 
         match self.build_resources(window) {
-            Ok((pipeline, buffer, texture, sampler)) => {
+            Ok((pipeline, buffer, texture, sampler, format_label)) => {
                 self.pipeline = Some(pipeline);
                 self.vertex_buffer = Some(buffer);
                 self.texture = Some(texture);
                 self.sampler = Some(sampler);
+                self.format_label = Some(format_label);
             }
             Err(err) => {
                 self.error = Some(err.to_string());
@@ -88,9 +96,12 @@ impl CustomDrawExample {
         CustomBufferId,
         CustomTextureId,
         CustomSamplerId,
+        &'static str,
     )> {
+        let (compressed_format, format_label) = choose_compressed_format(window)?;
+
         let pipeline = window.create_custom_pipeline(CustomPipelineDesc {
-            name: "custom_draw_demo".to_string(),
+            name: "custom_draw_compressed_texture".to_string(),
             shader_source: SHADER_SOURCE.to_string(),
             vertex_entry: "vs_main".to_string(),
             fragment_entry: "fs_main".to_string(),
@@ -132,39 +143,42 @@ impl CustomDrawExample {
             ],
         })?;
 
-        let vertex_data = quad_vertex_data();
         let vertex_buffer = window.create_custom_buffer(CustomBufferDesc {
-            name: "quad_vertices".to_string(),
-            data: vertex_data,
+            name: "compressed_texture_vertices".to_string(),
+            data: quad_vertex_data(),
         })?;
 
-        let texture_data = checker_texture_data();
         let texture = window.create_custom_texture(CustomTextureDesc {
-            name: "checker_texture".to_string(),
+            name: format!("compressed_texture_{}", format_label.to_lowercase()),
             dimension: CustomTextureDimension::D2,
-            width: 2,
-            height: 2,
-            format: CustomTextureFormat::Rgba8Unorm,
+            width: TEXTURE_WIDTH,
+            height: TEXTURE_HEIGHT,
+            format: compressed_format,
             usage: CustomTextureUsage::SAMPLED,
-            data: vec![texture_data],
+            data: vec![compressed_texture_data(
+                compressed_format,
+                TEXTURE_WIDTH,
+                TEXTURE_HEIGHT,
+            )?],
         })?;
 
         let sampler = window.create_custom_sampler(CustomSamplerDesc {
-            name: "checker_sampler".to_string(),
+            name: "compressed_texture_sampler".to_string(),
             min_filter: CustomFilterMode::Nearest,
             mag_filter: CustomFilterMode::Nearest,
             mipmap_filter: CustomFilterMode::Nearest,
             address_modes: [CustomAddressMode::ClampToEdge; 3],
         })?;
 
-        Ok((pipeline, vertex_buffer, texture, sampler))
+        Ok((pipeline, vertex_buffer, texture, sampler, format_label))
     }
 }
 
-impl Render for CustomDrawExample {
+impl Render for CompressedTextureExample {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let colors = Colors::for_appearance(window);
         self.ensure_resources(window);
+        let format_label = self.format_label.unwrap_or("pending");
 
         let header = div()
             .flex()
@@ -175,22 +189,17 @@ impl Render for CustomDrawExample {
                     .text_xl()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(colors.text)
-                    .child("Custom Draw API"),
+                    .child("Custom Draw API (Compressed Texture)"),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(colors.disabled)
-                    .child("WGSL pipeline + vertex buffer + texture/sampler"),
+                    .child(format!("Samples a {format_label} compressed texture")),
             );
 
         let surface: Hsla = colors.container.into();
-        let content = if let Some(err) = &self.error {
-            div()
-                .text_sm()
-                .text_color(gpui::red())
-                .child(format!("Custom draw unsupported: {err}"))
-        } else if let (Some(pipeline), Some(buffer), Some(texture), Some(sampler)) = (
+        let content = if let (Some(pipeline), Some(buffer), Some(texture), Some(sampler)) = (
             self.pipeline,
             self.vertex_buffer,
             self.texture,
@@ -237,6 +246,11 @@ impl Render for CustomDrawExample {
                 .border_color(colors.border)
                 .bg(surface.opacity(0.2))
                 .child(canvas(prepaint, paint).size_full())
+        } else if let Some(err) = &self.error {
+            div()
+                .text_sm()
+                .text_color(colors.disabled)
+                .child(err.clone())
         } else {
             div()
                 .text_sm()
@@ -317,12 +331,107 @@ fn quad_vertex_data_for_bounds(
     Arc::from(data)
 }
 
-fn checker_texture_data() -> Arc<[u8]> {
-    let data: [u8; 16] = [
-        0xff, 0x4d, 0x4d, 0xff, 0x4d, 0xff, 0x4d, 0xff, 0x4d, 0x4d, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff,
+fn choose_compressed_format(
+    window: &mut Window,
+) -> anyhow::Result<(CustomTextureFormat, &'static str)> {
+    let candidates = [
+        (CustomTextureFormat::Astc8x8Unorm, "ASTC 8x8"),
+        (CustomTextureFormat::Astc6x6Unorm, "ASTC 6x6"),
+        (CustomTextureFormat::Astc5x5Unorm, "ASTC 5x5"),
+        (CustomTextureFormat::Astc4x4Unorm, "ASTC 4x4"),
+        (CustomTextureFormat::PvrtcRgba4bppUnorm, "PVRTC RGBA 4bpp"),
+        (CustomTextureFormat::PvrtcRgba2bppUnorm, "PVRTC RGBA 2bpp"),
+        (CustomTextureFormat::Etc2Rgba8Unorm, "ETC2 RGBA8"),
+        (CustomTextureFormat::Bc7Unorm, "BC7"),
+        (CustomTextureFormat::Bc3Unorm, "BC3"),
+        (CustomTextureFormat::Bc1Unorm, "BC1"),
     ];
-    Arc::from(data)
+
+    for (format, label) in candidates {
+        if window.custom_texture_format_supported(format)? {
+            return Ok((format, label));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no supported compressed texture format found on this backend"
+    ))
+}
+
+fn compressed_block_layout(format: CustomTextureFormat) -> Option<(u32, u32, u32)> {
+    match format {
+        CustomTextureFormat::Bc1Unorm
+        | CustomTextureFormat::Bc1UnormSrgb
+        | CustomTextureFormat::Etc2Rgb8Unorm
+        | CustomTextureFormat::Etc2Rgb8UnormSrgb => Some((4, 4, 8)),
+        CustomTextureFormat::Bc3Unorm
+        | CustomTextureFormat::Bc3UnormSrgb
+        | CustomTextureFormat::Bc7Unorm
+        | CustomTextureFormat::Bc7UnormSrgb
+        | CustomTextureFormat::Etc2Rgba8Unorm
+        | CustomTextureFormat::Etc2Rgba8UnormSrgb
+        | CustomTextureFormat::Astc4x4Unorm
+        | CustomTextureFormat::Astc4x4UnormSrgb => Some((4, 4, 16)),
+        CustomTextureFormat::Astc5x5Unorm | CustomTextureFormat::Astc5x5UnormSrgb => {
+            Some((5, 5, 16))
+        }
+        CustomTextureFormat::Astc6x6Unorm | CustomTextureFormat::Astc6x6UnormSrgb => {
+            Some((6, 6, 16))
+        }
+        CustomTextureFormat::Astc8x8Unorm | CustomTextureFormat::Astc8x8UnormSrgb => {
+            Some((8, 8, 16))
+        }
+        CustomTextureFormat::PvrtcRgb2bppUnorm
+        | CustomTextureFormat::PvrtcRgb2bppUnormSrgb
+        | CustomTextureFormat::PvrtcRgba2bppUnorm
+        | CustomTextureFormat::PvrtcRgba2bppUnormSrgb => Some((16, 8, 8)),
+        CustomTextureFormat::PvrtcRgb4bppUnorm
+        | CustomTextureFormat::PvrtcRgb4bppUnormSrgb
+        | CustomTextureFormat::PvrtcRgba4bppUnorm
+        | CustomTextureFormat::PvrtcRgba4bppUnormSrgb => Some((8, 4, 8)),
+        _ => None,
+    }
+}
+
+fn compressed_texture_data(
+    format: CustomTextureFormat,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Arc<[u8]>> {
+    let Some((block_width, block_height, bytes_per_block)) = compressed_block_layout(format) else {
+        return Err(anyhow::anyhow!(
+            "texture format {format:?} is not compressed"
+        ));
+    };
+
+    let blocks_w = width.div_ceil(block_width);
+    let blocks_h = height.div_ceil(block_height);
+    let block_count = blocks_w * blocks_h;
+
+    let mut data = Vec::with_capacity((block_count * bytes_per_block) as usize);
+    for block_index in 0..block_count {
+        if matches!(
+            format,
+            CustomTextureFormat::Bc1Unorm | CustomTextureFormat::Bc1UnormSrgb
+        ) {
+            if block_index % 2 == 0 {
+                data.extend_from_slice(&BC1_RED_BLOCK);
+            } else {
+                data.extend_from_slice(&BC1_GREEN_BLOCK);
+            }
+            continue;
+        }
+
+        for byte_index in 0..bytes_per_block {
+            let value = (block_index as u8)
+                .wrapping_mul(29)
+                .wrapping_add(byte_index as u8)
+                .wrapping_add(17);
+            data.push(value);
+        }
+    }
+
+    Ok(Arc::from(data))
 }
 
 fn run_example() {
@@ -333,7 +442,7 @@ fn run_example() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(CustomDrawExample::new),
+            |_, cx| cx.new(CompressedTextureExample::new),
         )
         .expect("failed to open window");
 
