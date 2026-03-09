@@ -43,6 +43,7 @@ cargo run -p gpui --example custom_draw_api_animated
 cargo run -p gpui --example custom_draw_api_instanced
 cargo run -p gpui --example custom_draw_api_compute
 cargo run -p gpui --example custom_draw_api_offscreen
+cargo run -p gpui --example custom_draw_api_monkey
 cargo run -p gpui --example custom_draw_api_gpu_profiling
 cargo run -p gpui --example custom_draw_api_conformance
 cargo run -p gpui --example custom_draw_api_mixed
