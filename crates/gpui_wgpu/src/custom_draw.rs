@@ -197,6 +197,15 @@ impl WgpuCustomDrawRegistry {
         let mut profiling = self.profiling.lock();
         let submit_to_completed_ns = profiling.last_submit_to_completed_ns.take();
         let gpu_time_ns = profiling.last_gpu_time_ns.take();
+        let scheduled_to_completed_ns = gpu_time_ns;
+        let submit_to_scheduled_ns = match (submit_to_completed_ns, scheduled_to_completed_ns) {
+            (Some(submit_to_completed), Some(scheduled_to_completed))
+                if submit_to_completed >= scheduled_to_completed =>
+            {
+                Some(submit_to_completed - scheduled_to_completed)
+            }
+            _ => None,
+        };
 
         if profiling.gpu_profiling_enabled {
             profiling.last_gpu_profile = Some(CustomGpuFrameProfile {
@@ -216,9 +225,9 @@ impl WgpuCustomDrawRegistry {
                 custom_compute_pass_count,
                 retry_count,
                 cpu_encode_time_ns,
-                submit_to_scheduled_ns: None,
+                submit_to_scheduled_ns,
                 submit_to_completed_ns,
-                scheduled_to_completed_ns: None,
+                scheduled_to_completed_ns,
                 gpu_time_ns,
             });
         }
