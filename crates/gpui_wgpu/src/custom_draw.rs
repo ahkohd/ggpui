@@ -1933,6 +1933,18 @@ impl WgpuCustomDrawRegistry {
         let block = texture.format.block_info();
         let mip_width = (texture.width >> level).max(1);
         let mip_height = (texture.height >> level).max(1);
+        if texture.format.is_compressed()
+            && (!mip_width.is_multiple_of(block.width) || !mip_height.is_multiple_of(block.height))
+        {
+            return Err(anyhow!(
+                "compressed custom texture mip dimensions must be multiples of block size {}x{} (got {}x{})",
+                block.width,
+                block.height,
+                mip_width,
+                mip_height
+            ));
+        }
+        let rows_per_image = mip_height.div_ceil(block.height);
         let packed_bytes_per_row = mip_width.div_ceil(block.width).saturating_mul(block.bytes);
 
         let upload_bytes_per_row = bytes_per_row.unwrap_or(packed_bytes_per_row);
@@ -1952,7 +1964,7 @@ impl WgpuCustomDrawRegistry {
         }
 
         let required_bytes = u64::from(upload_bytes_per_row)
-            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(u64::from(rows_per_image))
             .saturating_mul(u64::from(texture.array_layer_count));
         if required_bytes > data.len() as u64 {
             return Err(anyhow!(
@@ -1973,7 +1985,7 @@ impl WgpuCustomDrawRegistry {
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(upload_bytes_per_row),
-                rows_per_image: Some(mip_height),
+                rows_per_image: Some(rows_per_image),
             },
             wgpu::Extent3d {
                 width: mip_width,
@@ -2389,15 +2401,21 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             ));
         }
 
-        if texture_entry.format.is_compressed() {
-            return Err(anyhow!(
-                "compressed custom texture updates from buffer are not yet supported on wgpu"
-            ));
-        }
-
         let block = texture_entry.format.block_info();
         let mip_width = (texture_entry.width >> level).max(1);
         let mip_height = (texture_entry.height >> level).max(1);
+        if texture_entry.format.is_compressed()
+            && (!mip_width.is_multiple_of(block.width) || !mip_height.is_multiple_of(block.height))
+        {
+            return Err(anyhow!(
+                "compressed custom texture mip dimensions must be multiples of block size {}x{} (got {}x{})",
+                block.width,
+                block.height,
+                mip_width,
+                mip_height
+            ));
+        }
+        let rows_per_image = mip_height.div_ceil(block.height);
         let packed_bytes_per_row = mip_width.div_ceil(block.width).saturating_mul(block.bytes);
         let upload_bytes_per_row = bytes_per_row.unwrap_or(packed_bytes_per_row);
 
@@ -2417,7 +2435,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         }
 
         let required_bytes = u64::from(upload_bytes_per_row)
-            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(u64::from(rows_per_image))
             .saturating_mul(u64::from(texture_entry.array_layer_count));
 
         let (source_buffer, source_offset, source_size) = {
@@ -2479,7 +2497,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
             });
 
         if texture_entry.array_layer_count == 1
-            && mip_height == 1
+            && rows_per_image == 1
             && upload_bytes_per_row == packed_bytes_per_row
         {
             encoder.copy_buffer_to_texture(
@@ -2499,7 +2517,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                 },
                 wgpu::Extent3d {
                     width: mip_width,
-                    height: 1,
+                    height: mip_height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -2510,7 +2528,7 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: source_offset,
                         bytes_per_row: Some(upload_bytes_per_row),
-                        rows_per_image: Some(mip_height),
+                        rows_per_image: Some(rows_per_image),
                     },
                 },
                 wgpu::TexelCopyTextureInfo {
@@ -2528,9 +2546,9 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         } else {
             let row_size = u64::from(upload_bytes_per_row);
             for layer in 0..texture_entry.array_layer_count {
-                for row in 0..mip_height {
+                for row in 0..rows_per_image {
                     let row_index = u64::from(layer)
-                        .saturating_mul(u64::from(mip_height))
+                        .saturating_mul(u64::from(rows_per_image))
                         .saturating_add(u64::from(row));
                     let row_offset = source_offset
                         .checked_add(row_index.saturating_mul(row_size))
@@ -2549,14 +2567,14 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
                             mip_level: level,
                             origin: wgpu::Origin3d {
                                 x: 0,
-                                y: row,
+                                y: row.saturating_mul(block.height),
                                 z: layer,
                             },
                             aspect: wgpu::TextureAspect::All,
                         },
                         wgpu::Extent3d {
                             width: mip_width,
-                            height: 1,
+                            height: block.height,
                             depth_or_array_layers: 1,
                         },
                     );
