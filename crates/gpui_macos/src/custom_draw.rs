@@ -1793,7 +1793,9 @@ fn collect_binding_array_handles(
 }
 
 fn naga_capabilities(bindings: &[CustomBindingDesc]) -> naga::valid::Capabilities {
-    let mut capabilities = naga::valid::Capabilities::empty();
+    // Allow validating WGSL modules that declare var<push_constant> so we can rewrite
+    // them to a generated uniform binding for backend parity.
+    let mut capabilities = naga::valid::Capabilities::PUSH_CONSTANT;
     for binding in bindings {
         match binding.kind {
             CustomBindingKind::BufferArray { .. } | CustomBindingKind::TextureArray { .. } => {
