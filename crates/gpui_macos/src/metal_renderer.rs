@@ -131,6 +131,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    depth_disabled_state: metal::DepthStencilState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -301,6 +302,7 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let depth_disabled_state = create_depth_disabled_state(&device);
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -326,6 +328,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            depth_disabled_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1769,6 +1772,8 @@ impl MetalRenderer {
             &textures_snapshot,
             &samplers_snapshot,
         );
+        command_encoder.set_depth_stencil_state(&self.depth_disabled_state);
+        command_encoder.set_cull_mode(metal::MTLCullMode::None);
 
         !matches!(outcome, CustomDrawBindOutcome::OutOfSpace)
     }
@@ -3034,6 +3039,13 @@ fn new_command_encoder<'a>(
         zfar: 1.0,
     });
     command_encoder
+}
+
+fn create_depth_disabled_state(device: &metal::DeviceRef) -> metal::DepthStencilState {
+    let descriptor = metal::DepthStencilDescriptor::new();
+    descriptor.set_depth_compare_function(metal::MTLCompareFunction::Always);
+    descriptor.set_depth_write_enabled(false);
+    device.new_depth_stencil_state(&descriptor)
 }
 
 fn build_pipeline_state(
