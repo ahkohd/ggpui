@@ -140,6 +140,7 @@ impl WgpuContext {
             wgpu::Features::TEXTURE_BINDING_ARRAY,
             wgpu::Features::BUFFER_BINDING_ARRAY,
             wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
+            wgpu::Features::TIMESTAMP_QUERY,
             wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
             wgpu::Features::STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING,
         ] {

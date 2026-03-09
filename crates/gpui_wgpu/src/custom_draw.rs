@@ -83,6 +83,7 @@ struct WgpuCustomProfilingState {
     last_gpu_profile: Option<CustomGpuFrameProfile>,
     last_frame_diagnostics: Option<CustomFrameDiagnostics>,
     last_submit_to_completed_ns: Option<u64>,
+    last_gpu_time_ns: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +96,12 @@ struct PushConstantsInfo {
     name: &'static str,
     size: u32,
     slot: CustomBindingSlot,
+}
+
+pub(crate) struct WgpuFrameGpuTimingCapture {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,6 +160,7 @@ pub(crate) struct WgpuCustomDrawRegistry {
     depth_targets: Mutex<Vec<Option<WgpuCustomDepthTarget>>>,
     samplers: Mutex<Vec<Option<wgpu::Sampler>>>,
     profiling: Arc<Mutex<WgpuCustomProfilingState>>,
+    timestamp_query_supported: bool,
 }
 
 impl WgpuCustomDrawRegistry {
@@ -161,6 +169,7 @@ impl WgpuCustomDrawRegistry {
         queue: Arc<wgpu::Queue>,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
+        let timestamp_query_supported = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         Self {
             device,
             queue,
@@ -172,6 +181,7 @@ impl WgpuCustomDrawRegistry {
             depth_targets: Mutex::new(Vec::new()),
             samplers: Mutex::new(Vec::new()),
             profiling: Arc::new(Mutex::new(WgpuCustomProfilingState::default())),
+            timestamp_query_supported,
         }
     }
 
@@ -186,6 +196,7 @@ impl WgpuCustomDrawRegistry {
     ) {
         let mut profiling = self.profiling.lock();
         let submit_to_completed_ns = profiling.last_submit_to_completed_ns.take();
+        let gpu_time_ns = profiling.last_gpu_time_ns.take();
 
         if profiling.gpu_profiling_enabled {
             profiling.last_gpu_profile = Some(CustomGpuFrameProfile {
@@ -193,7 +204,7 @@ impl WgpuCustomDrawRegistry {
                 custom_compute_count,
                 custom_render_pass_count,
                 custom_compute_pass_count,
-                gpu_time_ns: None,
+                gpu_time_ns,
             });
         }
 
@@ -208,9 +219,104 @@ impl WgpuCustomDrawRegistry {
                 submit_to_scheduled_ns: None,
                 submit_to_completed_ns,
                 scheduled_to_completed_ns: None,
-                gpu_time_ns: None,
+                gpu_time_ns,
             });
         }
+    }
+
+    pub(crate) fn begin_frame_gpu_timing(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<WgpuFrameGpuTimingCapture> {
+        if !self.timestamp_query_supported {
+            return None;
+        }
+
+        let profiling = self.profiling.lock();
+        let requested = profiling.gpu_profiling_enabled || profiling.frame_diagnostics_enabled;
+        drop(profiling);
+        if !requested {
+            return None;
+        }
+
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("custom_draw_gpu_timing_query_set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+
+        let query_data_size = u64::from(wgpu::QUERY_SIZE) * 2;
+        let resolve_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("custom_draw_gpu_timing_resolve"),
+            size: query_data_size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("custom_draw_gpu_timing_readback"),
+            size: query_data_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.write_timestamp(&query_set, 0);
+
+        Some(WgpuFrameGpuTimingCapture {
+            query_set,
+            resolve_buffer,
+            readback_buffer,
+        })
+    }
+
+    pub(crate) fn finish_frame_gpu_timing(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu_timing: WgpuFrameGpuTimingCapture,
+    ) -> wgpu::Buffer {
+        encoder.write_timestamp(&gpu_timing.query_set, 1);
+        encoder.resolve_query_set(&gpu_timing.query_set, 0..2, &gpu_timing.resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(
+            &gpu_timing.resolve_buffer,
+            0,
+            &gpu_timing.readback_buffer,
+            0,
+            u64::from(wgpu::QUERY_SIZE) * 2,
+        );
+
+        gpu_timing.readback_buffer
+    }
+
+    pub(crate) fn record_frame_gpu_timing(&self, readback_buffer: wgpu::Buffer) {
+        let timestamp_period = self.queue.get_timestamp_period();
+        let profiling = Arc::clone(&self.profiling);
+        let callback_buffer = readback_buffer.clone();
+        readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| match result {
+                Ok(()) => {
+                    let mapped = callback_buffer.slice(..).get_mapped_range();
+                    if mapped.len() >= 16 {
+                        let mut start_bytes = [0u8; 8];
+                        start_bytes.copy_from_slice(&mapped[0..8]);
+                        let mut end_bytes = [0u8; 8];
+                        end_bytes.copy_from_slice(&mapped[8..16]);
+                        let start = u64::from_le_bytes(start_bytes);
+                        let end = u64::from_le_bytes(end_bytes);
+                        if end >= start {
+                            let ticks = end - start;
+                            let gpu_time_ns =
+                                ((ticks as f64) * f64::from(timestamp_period)).round() as u64;
+                            profiling.lock().last_gpu_time_ns = Some(gpu_time_ns);
+                        }
+                    }
+                    drop(mapped);
+                    callback_buffer.unmap();
+                }
+                Err(error) => {
+                    log::warn!("custom draw gpu timing readback failed: {error:?}");
+                }
+            });
     }
 
     pub(crate) fn record_submission_completion(&self) {
@@ -1919,6 +2025,9 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         profiling.gpu_profiling_enabled = enabled;
         if !enabled {
             profiling.last_gpu_profile = None;
+            if !profiling.frame_diagnostics_enabled {
+                profiling.last_gpu_time_ns = None;
+            }
         }
         Ok(())
     }
@@ -1932,6 +2041,9 @@ impl CustomDrawRegistry for WgpuCustomDrawRegistry {
         profiling.frame_diagnostics_enabled = enabled;
         if !enabled {
             profiling.last_frame_diagnostics = None;
+            if !profiling.gpu_profiling_enabled {
+                profiling.last_gpu_time_ns = None;
+            }
         }
         Ok(())
     }

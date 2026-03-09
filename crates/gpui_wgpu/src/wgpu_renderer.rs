@@ -1150,6 +1150,7 @@ impl WgpuRenderer {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("main_encoder"),
                     });
+            let gpu_timing_capture = self.custom_draw.begin_frame_gpu_timing(&mut encoder);
 
             let custom_compute_pass_count = self
                 .custom_draw
@@ -1307,6 +1308,11 @@ impl WgpuRenderer {
                 continue;
             }
 
+            let gpu_timing_readback = gpu_timing_capture.map(|capture| {
+                self.custom_draw
+                    .finish_frame_gpu_timing(&mut encoder, capture)
+            });
+
             let cpu_encode_time_ns =
                 u64::try_from(frame_encode_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.custom_draw.record_frame_metrics(
@@ -1321,6 +1327,9 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            if let Some(readback_buffer) = gpu_timing_readback {
+                self.custom_draw.record_frame_gpu_timing(readback_buffer);
+            }
             self.custom_draw.record_submission_completion();
             frame.present();
             if let Err(error) = self.resources().device.poll(wgpu::PollType::Poll) {
