@@ -12,8 +12,8 @@ use gpui::{
     CustomBindingValue, CustomBufferDesc, CustomBufferId, CustomBufferSource,
     CustomComputeDispatch, CustomComputePipelineDesc, CustomComputePipelineId, CustomDrawParams,
     CustomPipelineDesc, CustomPipelineId, CustomPipelineState, CustomPrimitiveTopology,
-    CustomUniformBuilder, Hsla, Render, Styled, Window, WindowBounds, WindowOptions, canvas, div,
-    prelude::*, px, size,
+    CustomPushConstantsDesc, CustomUniformBuilder, Hsla, Render, Styled, Window, WindowBounds,
+    WindowOptions, canvas, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 
@@ -23,8 +23,16 @@ struct Params {
   viewport: vec4<f32>,
 };
 
+struct PushConstants {
+  phase: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
+};
+
 var<storage, read_write> b0: array<vec2<f32>, 6>;
 var<uniform> b1: Params;
+var<push_constant> push_constants: PushConstants;
 
 @compute @workgroup_size(1)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -43,7 +51,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     default: { pos = vec2<f32>(-0.5, 0.5); }
   }
 
-  b0[index] = pos * b1.viewport.z;
+  let wobble = 0.08 * sin(push_constants.phase + f32(index) * 0.7);
+  b0[index] = pos * b1.viewport.z + vec2<f32>(wobble, -wobble);
 }
 "#;
 
@@ -53,12 +62,20 @@ struct Params {
   viewport: vec4<f32>,
 };
 
+struct PushConstants {
+  phase: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
+};
+
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
 };
 
 var<storage, read> b0: array<vec2<f32>, 6>;
 var<uniform> b1: Params;
+var<push_constant> push_constants: PushConstants;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -78,7 +95,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
-  return vec4<f32>(0.35, 0.75, 0.95, 1.0);
+  let pulse = 0.65 + 0.35 * sin(push_constants.phase * 1.3);
+  return vec4<f32>(0.35 * pulse, 0.75 * pulse, 0.95, 1.0);
 }
 "#;
 
@@ -134,7 +152,7 @@ impl ComputeDrawExample {
                 name: "custom_draw_compute".to_string(),
                 shader_source: COMPUTE_SHADER_SOURCE.to_string(),
                 entry_point: "cs_main".to_string(),
-                push_constants: None,
+                push_constants: Some(CustomPushConstantsDesc { size: 16 }),
                 bindings: vec![
                     CustomBindingDesc {
                         name: CustomBindingName::B0,
@@ -158,7 +176,7 @@ impl ComputeDrawExample {
             primitive: CustomPrimitiveTopology::TriangleList,
             color_targets: Vec::new(),
             state: CustomPipelineState::default(),
-            push_constants: None,
+            push_constants: Some(CustomPushConstantsDesc { size: 16 }),
             bindings: vec![
                 CustomBindingDesc {
                     name: CustomBindingName::B0,
@@ -221,13 +239,14 @@ impl Render for ComputeDrawExample {
             let prepaint = move |bounds: Bounds<_>, window: &mut Window, _cx: &mut App| {
                 let layout_bounds = inset_bounds(bounds, px(1.0));
                 let viewport = window.viewport_size();
-                let t = start.elapsed().as_secs_f32();
-                let scale = 0.7 + 0.15 * t.sin();
+                let phase = start.elapsed().as_secs_f32();
+                let scale = 0.7 + 0.15 * phase.sin();
                 let uniform = build_uniform(layout_bounds, viewport, scale);
+                let push_constants = build_push_constants(phase);
                 ComputeFrame {
                     compute: CustomComputeDispatch {
                         pipeline: compute_pipeline,
-                        push_constants: None,
+                        push_constants: Some(Arc::clone(&push_constants)),
                         bindings: vec![
                             CustomBindingValue::Buffer(CustomBufferSource::Buffer(
                                 positions_buffer,
@@ -247,7 +266,7 @@ impl Render for ComputeDrawExample {
                         index_count: 0,
                         target: None,
                         instance_count: 1,
-                        push_constants: None,
+                        push_constants: Some(push_constants),
                         bindings: vec![
                             CustomBindingValue::Buffer(CustomBufferSource::Buffer(
                                 positions_buffer,
@@ -322,6 +341,12 @@ fn build_uniform(
         scale,
         0.0,
     );
+    builder.finish()
+}
+
+fn build_push_constants(phase: f32) -> Arc<[u8]> {
+    let mut builder = CustomUniformBuilder::new();
+    builder.push_vec4(phase, 0.0, 0.0, 0.0);
     builder.finish()
 }
 
