@@ -1323,6 +1323,9 @@ impl WgpuRenderer {
                 .submit(std::iter::once(encoder.finish()));
             self.custom_draw.record_submission_completion();
             frame.present();
+            if let Err(error) = self.resources().device.poll(wgpu::PollType::Poll) {
+                warn!("Failed to poll device after frame submit: {error:?}");
+            }
             return;
         }
     }
