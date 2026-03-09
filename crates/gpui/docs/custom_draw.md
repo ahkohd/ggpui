@@ -60,6 +60,12 @@ cargo run -p gpui --example custom_draw_api_metallib
 cargo run -p gpui --example custom_draw_stress
 ```
 
+Optional visual state-leak guard test (macOS main-thread run):
+
+```sh
+cargo test -p gpui_platform --features "test-support,visual-test-guard" -- --ignored --test-threads=1 test_window_custom_depth_draw_does_not_hide_panel_borders
+```
+
 ## Runtime compressed-format selection
 
 Use runtime capability queries before texture creation:

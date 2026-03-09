@@ -62,17 +62,20 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 #[cfg(all(test, target_os = "macos", feature = "test-support"))]
 mod tests {
     use super::*;
+    #[cfg(feature = "visual-test-guard")]
     use gpui::{
-        App, AppContext, Bounds, Context, CustomBindingDesc, CustomBindingKind, CustomBindingName,
+        App, Bounds, Context, CustomBindingDesc, CustomBindingKind, CustomBindingName,
         CustomBindingValue, CustomBufferDesc, CustomBufferId, CustomBufferSource, CustomCullMode,
         CustomDepthCompare, CustomDepthFormat, CustomDepthState, CustomDrawParams,
         CustomIndexBuffer, CustomIndexFormat, CustomPipelineDesc, CustomPipelineId,
         CustomPipelineState, CustomPrimitiveTopology, CustomUniformBuilder, CustomVertexAttribute,
         CustomVertexAttributeName, CustomVertexBuffer, CustomVertexFetch, CustomVertexFormat,
-        CustomVertexLayout, Empty, ParentElement, Pixels, Point, Render, Size, Styled,
-        VisualTestAppContext, Window, canvas, div, px, size,
+        CustomVertexLayout, ParentElement, Pixels, Point, Render, Size, Styled, Window, canvas,
+        div, px, size,
     };
+    use gpui::{AppContext, Empty, VisualTestAppContext};
     use std::cell::RefCell;
+    #[cfg(feature = "visual-test-guard")]
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -178,6 +181,7 @@ mod tests {
         assert!(*task_ran.borrow());
     }
 
+    #[cfg(feature = "visual-test-guard")]
     const STATE_LEAK_SHADER_SOURCE: &str = r#"
 struct VertexInput {
   a0: vec3<f32>,
@@ -213,9 +217,12 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
+    #[cfg(feature = "visual-test-guard")]
     const STATE_LEAK_PANEL_WIDTH: f32 = 320.0;
+    #[cfg(feature = "visual-test-guard")]
     const STATE_LEAK_PANEL_HEIGHT: f32 = 320.0;
 
+    #[cfg(feature = "visual-test-guard")]
     struct WindowDepthStateLeakGuardView {
         pipeline: Option<CustomPipelineId>,
         vertex_buffer: Option<CustomBufferId>,
@@ -223,6 +230,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         error: Option<String>,
     }
 
+    #[cfg(feature = "visual-test-guard")]
     impl WindowDepthStateLeakGuardView {
         fn new(_cx: &mut Context<Self>) -> Self {
             Self {
@@ -304,6 +312,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         }
     }
 
+    #[cfg(feature = "visual-test-guard")]
     impl Render for WindowDepthStateLeakGuardView {
         fn render(
             &mut self,
@@ -376,6 +385,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         }
     }
 
+    #[cfg(feature = "visual-test-guard")]
     fn inset_bounds(bounds: Bounds<Pixels>, inset: Pixels) -> Bounds<Pixels> {
         let width = (bounds.size.width - inset * 2.0).max(px(1.0));
         let height = (bounds.size.height - inset * 2.0).max(px(1.0));
@@ -385,6 +395,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         }
     }
 
+    #[cfg(feature = "visual-test-guard")]
     fn state_leak_vertex_data() -> Arc<[u8]> {
         let vertices: [[f32; 3]; 4] = [
             [-1.0, -1.0, 0.4],
@@ -403,6 +414,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         Arc::from(data)
     }
 
+    #[cfg(feature = "visual-test-guard")]
     fn state_leak_index_data() -> Arc<[u8]> {
         let indices: [u16; 6] = [0, 1, 2, 2, 3, 0];
         let mut data = Vec::with_capacity(indices.len() * 2);
@@ -412,6 +424,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         Arc::from(data)
     }
 
+    #[cfg(feature = "visual-test-guard")]
     fn state_leak_uniform(bounds: Bounds<Pixels>, viewport_size: Size<Pixels>) -> Arc<[u8]> {
         let mut builder = CustomUniformBuilder::new();
         builder
@@ -430,6 +443,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         builder.finish()
     }
 
+    #[cfg(feature = "visual-test-guard")]
     fn sample_luminance_at_logical_coordinate(
         screenshot: &image::RgbaImage,
         viewport_size: Size<Pixels>,
@@ -475,6 +489,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         (total_luminance / sample_count).min(u32::from(u8::MAX)) as u8
     }
 
+    #[cfg(feature = "visual-test-guard")]
     #[test]
     #[ignore] // Requires macOS main thread
     fn test_window_custom_depth_draw_does_not_hide_panel_borders() {
