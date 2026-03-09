@@ -11,6 +11,12 @@ workspace = true
 [lib]
 path = "src/gpui_platform.rs"
 
+[[test]]
+name = "window_depth_state_leak_guard"
+path = "tests/window_depth_state_leak_guard.rs"
+harness = false
+required-features = ["test-support", "visual-test-guard"]
+
 [features]
 default = []
 font-kit = ["gpui_macos/font-kit"]
