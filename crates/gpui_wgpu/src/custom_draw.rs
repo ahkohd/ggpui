@@ -1201,14 +1201,10 @@ impl WgpuCustomDrawRegistry {
                 | CustomBindingKind::BufferArray { .. }
                 | CustomBindingKind::Texture
                 | CustomBindingKind::TextureArray { .. }
+                | CustomBindingKind::StorageTexture
+                | CustomBindingKind::StorageTextureArray { .. }
                 | CustomBindingKind::Sampler
                 | CustomBindingKind::Uniform { .. } => {}
-                CustomBindingKind::StorageTexture
-                | CustomBindingKind::StorageTextureArray { .. } => {
-                    return Err(anyhow!(
-                        "custom draw storage textures are not yet supported on wgpu"
-                    ));
-                }
             }
 
             let required_features = binding_kind_required_features(binding.kind);
@@ -1290,6 +1286,13 @@ impl WgpuCustomDrawRegistry {
             collect_sampled_texture_binding_info(&module, &info, fragment_entry_index)?,
         )?;
 
+        let mut storage_texture_infos =
+            collect_storage_texture_binding_info(&module, &info, vertex_entry_index)?;
+        merge_storage_texture_binding_infos(
+            &mut storage_texture_infos,
+            collect_storage_texture_binding_info(&module, &info, fragment_entry_index)?,
+        )?;
+
         let rewritten_wgsl =
             naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
                 .map_err(|error| anyhow!("custom draw WGSL rewrite failed: {error}"))?;
@@ -1325,7 +1328,9 @@ impl WgpuCustomDrawRegistry {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: map_binding_type(
                         binding.kind,
-                        None,
+                        storage_texture_infos
+                            .get(&(slot.group, slot.binding))
+                            .copied(),
                         sampled_texture_infos
                             .get(&(slot.group, slot.binding))
                             .copied(),
@@ -3047,6 +3052,27 @@ fn collect_sampled_texture_binding_info(
     }
 
     Ok(sampled_texture_infos)
+}
+
+fn merge_storage_texture_binding_infos(
+    target: &mut HashMap<(u32, u32), WgpuStorageTextureBindingInfo>,
+    source: HashMap<(u32, u32), WgpuStorageTextureBindingInfo>,
+) -> Result<()> {
+    for (slot, info) in source {
+        if let Some(existing) = target.get(&slot) {
+            if existing != &info {
+                return Err(anyhow!(
+                    "custom storage texture binding metadata mismatch at @group({}) @binding({})",
+                    slot.0,
+                    slot.1
+                ));
+            }
+            continue;
+        }
+        target.insert(slot, info);
+    }
+
+    Ok(())
 }
 
 fn merge_sampled_texture_binding_infos(
