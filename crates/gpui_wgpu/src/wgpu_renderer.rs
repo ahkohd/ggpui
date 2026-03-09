@@ -1321,6 +1321,7 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            self.custom_draw.record_submission_completion();
             frame.present();
             return;
         }

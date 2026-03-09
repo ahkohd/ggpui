@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone)]
 struct WgpuBindingSpec {
@@ -81,6 +82,7 @@ struct WgpuCustomProfilingState {
     frame_diagnostics_enabled: bool,
     last_gpu_profile: Option<CustomGpuFrameProfile>,
     last_frame_diagnostics: Option<CustomFrameDiagnostics>,
+    last_submit_to_completed_ns: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -144,7 +146,7 @@ pub(crate) struct WgpuCustomDrawRegistry {
     textures: Mutex<Vec<Option<WgpuCustomTexture>>>,
     depth_targets: Mutex<Vec<Option<WgpuCustomDepthTarget>>>,
     samplers: Mutex<Vec<Option<wgpu::Sampler>>>,
-    profiling: Mutex<WgpuCustomProfilingState>,
+    profiling: Arc<Mutex<WgpuCustomProfilingState>>,
 }
 
 impl WgpuCustomDrawRegistry {
@@ -163,7 +165,7 @@ impl WgpuCustomDrawRegistry {
             textures: Mutex::new(Vec::new()),
             depth_targets: Mutex::new(Vec::new()),
             samplers: Mutex::new(Vec::new()),
-            profiling: Mutex::new(WgpuCustomProfilingState::default()),
+            profiling: Arc::new(Mutex::new(WgpuCustomProfilingState::default())),
         }
     }
 
@@ -177,6 +179,7 @@ impl WgpuCustomDrawRegistry {
         cpu_encode_time_ns: u64,
     ) {
         let mut profiling = self.profiling.lock();
+        let submit_to_completed_ns = profiling.last_submit_to_completed_ns.take();
 
         if profiling.gpu_profiling_enabled {
             profiling.last_gpu_profile = Some(CustomGpuFrameProfile {
@@ -197,11 +200,20 @@ impl WgpuCustomDrawRegistry {
                 retry_count,
                 cpu_encode_time_ns,
                 submit_to_scheduled_ns: None,
-                submit_to_completed_ns: None,
+                submit_to_completed_ns,
                 scheduled_to_completed_ns: None,
                 gpu_time_ns: None,
             });
         }
+    }
+
+    pub(crate) fn record_submission_completion(&self) {
+        let submit_start = Instant::now();
+        let profiling = Arc::clone(&self.profiling);
+        self.queue.on_submitted_work_done(move || {
+            let elapsed_ns = submit_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            profiling.lock().last_submit_to_completed_ns = Some(elapsed_ns);
+        });
     }
 
     pub(crate) fn draw_window_custom_draws(
