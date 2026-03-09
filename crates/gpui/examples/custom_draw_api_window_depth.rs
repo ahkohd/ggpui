@@ -288,11 +288,11 @@ fn cube_vertex_data() -> Arc<[u8]> {
 
 fn cube_index_data() -> Arc<[u8]> {
     let indices: [u16; INDEX_COUNT as usize] = [
-        0, 1, 2, 2, 3, 0, // back
+        0, 3, 2, 2, 1, 0, // back
         4, 5, 6, 6, 7, 4, // front
         0, 4, 7, 7, 3, 0, // left
-        1, 5, 6, 6, 2, 1, // right
-        3, 2, 6, 6, 7, 3, // top
+        1, 2, 6, 6, 5, 1, // right
+        3, 7, 6, 6, 2, 3, // top
         0, 1, 5, 5, 4, 0, // bottom
     ];
 
