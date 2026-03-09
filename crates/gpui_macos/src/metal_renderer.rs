@@ -139,6 +139,7 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    window_custom_depth_texture: Option<metal::Texture>,
     path_sample_count: u32,
 }
 
@@ -332,6 +333,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            window_custom_depth_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -374,6 +376,7 @@ impl MetalRenderer {
             height: DevicePixels(size.height as i32),
         };
         self.update_path_intermediate_textures(device_pixels_size);
+        self.update_window_custom_depth_texture(device_pixels_size);
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -411,6 +414,35 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
         } else {
             self.path_intermediate_msaa_texture = None;
+        }
+    }
+
+    fn update_window_custom_depth_texture(&mut self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.window_custom_depth_texture = None;
+            return;
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::Depth32Float);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+
+        self.window_custom_depth_texture = Some(self.device.new_texture(&descriptor));
+    }
+
+    fn ensure_window_custom_depth_texture(&mut self, size: Size<DevicePixels>) {
+        let width = size.width.0.max(1) as u64;
+        let height = size.height.0.max(1) as u64;
+        let needs_resize = match self.window_custom_depth_texture.as_ref() {
+            Some(texture) => texture.width() != width || texture.height() != height,
+            None => true,
+        };
+
+        if needs_resize {
+            self.update_window_custom_depth_texture(size);
         }
     }
 
@@ -685,6 +717,9 @@ impl MetalRenderer {
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        self.ensure_window_custom_depth_texture(viewport_size);
+        let window_custom_depth_texture = self.window_custom_depth_texture.clone();
+
         self.dispatch_custom_computes(
             scene,
             command_buffer,
@@ -702,6 +737,8 @@ impl MetalRenderer {
             command_buffer,
             drawable,
             viewport_size,
+            window_custom_depth_texture.as_deref(),
+            metal::MTLLoadAction::Clear,
             |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
                 color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
@@ -740,6 +777,8 @@ impl MetalRenderer {
                         command_buffer,
                         drawable,
                         viewport_size,
+                        window_custom_depth_texture.as_deref(),
+                        metal::MTLLoadAction::Load,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
@@ -1714,6 +1753,10 @@ impl MetalRenderer {
         let samplers_snapshot = self.custom_draw.samplers_snapshot();
 
         let color_formats = [self.custom_draw.surface_format()];
+        let window_depth_format = self
+            .window_custom_depth_texture
+            .as_ref()
+            .map(|_| metal::MTLPixelFormat::Depth32Float);
         let outcome = self.draw_custom_draws_for_target(
             &draws,
             instance_buffer,
@@ -1721,7 +1764,7 @@ impl MetalRenderer {
             command_encoder,
             color_formats.as_slice(),
             1,
-            None,
+            window_depth_format,
             &buffers_snapshot,
             &textures_snapshot,
             &samplers_snapshot,
@@ -2957,6 +3000,8 @@ fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     drawable: &'a metal::MetalDrawableRef,
     viewport_size: Size<DevicePixels>,
+    depth_texture: Option<&'a metal::TextureRef>,
+    depth_load_action: metal::MTLLoadAction,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -2967,6 +3012,17 @@ fn new_command_encoder<'a>(
     color_attachment.set_texture(Some(drawable.texture()));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
+
+    if let Some(depth_texture) = depth_texture
+        && let Some(depth_attachment) = render_pass_descriptor.depth_attachment()
+    {
+        depth_attachment.set_texture(Some(depth_texture));
+        depth_attachment.set_load_action(depth_load_action);
+        depth_attachment.set_store_action(metal::MTLStoreAction::Store);
+        if matches!(depth_load_action, metal::MTLLoadAction::Clear) {
+            depth_attachment.set_clear_depth(1.0);
+        }
+    }
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {

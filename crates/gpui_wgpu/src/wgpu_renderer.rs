@@ -113,6 +113,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    window_depth_texture: Option<wgpu::Texture>,
+    window_depth_view: Option<wgpu::TextureView>,
 }
 
 pub struct WgpuRenderer {
@@ -452,6 +454,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            window_depth_texture: None,
+            window_depth_view: None,
         };
 
         Ok(Self {
@@ -907,6 +911,29 @@ impl WgpuRenderer {
         Some((texture, view))
     }
 
+    fn create_window_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window_custom_depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
@@ -944,6 +971,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.window_depth_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -956,6 +986,8 @@ impl WgpuRenderer {
             resources.path_intermediate_view = None;
             resources.path_msaa_texture = None;
             resources.path_msaa_view = None;
+            resources.window_depth_texture = None;
+            resources.window_depth_view = None;
         }
     }
 
@@ -985,6 +1017,21 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+    }
+
+    fn ensure_window_depth_texture(&mut self) {
+        if self.resources().window_depth_texture.is_some() {
+            return;
+        }
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let resources = self.resources_mut();
+
+        let (texture, view) =
+            Self::create_window_depth_texture(&resources.device, width.max(1), height.max(1));
+        resources.window_depth_texture = Some(texture);
+        resources.window_depth_view = Some(view);
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1084,6 +1131,7 @@ impl WgpuRenderer {
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
+        self.ensure_window_depth_texture();
 
         let frame_view = frame
             .texture
@@ -1175,6 +1223,7 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
 
+                let mut window_depth_cleared = false;
                 for batch in scene.batches() {
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
@@ -1258,15 +1307,26 @@ impl WgpuRenderer {
                         PrimitiveBatch::Custom(range) => {
                             drop(pass);
 
-                            custom_render_pass_count = custom_render_pass_count.saturating_add(
+                            let window_depth_view = self.resources().window_depth_view.as_ref();
+                            let window_depth_format =
+                                window_depth_view.map(|_| wgpu::TextureFormat::Depth32Float);
+                            let clear_window_depth = !window_depth_cleared;
+                            let window_custom_render_pass_count =
                                 self.custom_draw.draw_window_custom_draws(
                                     &scene.custom_draws[range],
                                     &mut encoder,
                                     &frame_view,
+                                    window_depth_view,
+                                    window_depth_format,
+                                    clear_window_depth,
                                     self.surface_config.width,
                                     self.surface_config.height,
-                                ),
-                            );
+                                );
+                            if window_custom_render_pass_count > 0 {
+                                window_depth_cleared = true;
+                            }
+                            custom_render_pass_count = custom_render_pass_count
+                                .saturating_add(window_custom_render_pass_count);
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),

@@ -43,6 +43,7 @@ cargo run -p gpui --example custom_draw_api_animated
 cargo run -p gpui --example custom_draw_api_instanced
 cargo run -p gpui --example custom_draw_api_compute
 cargo run -p gpui --example custom_draw_api_offscreen
+cargo run -p gpui --example custom_draw_api_window_depth
 cargo run -p gpui --example custom_draw_api_monkey
 cargo run -p gpui --example custom_draw_api_gpu_profiling
 cargo run -p gpui --example custom_draw_api_conformance
@@ -100,6 +101,7 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 ## Notes and limitations
 
 - Depth format support is currently `Depth32Float`.
+- Window-target custom draws support single-sample depth testing (`Depth32Float`).
 - Window-surface rendering uses one sample. MSAA is for offscreen targets.
 - Binding-array support through WGSL to MSL currently works for texture arrays.
 - Buffer binding arrays in WGSL to MSL remain limited by translator support. Use precompiled MSL or `.metallib` when needed.

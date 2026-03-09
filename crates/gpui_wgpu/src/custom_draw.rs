@@ -342,6 +342,9 @@ impl WgpuCustomDrawRegistry {
         draws: &[CustomDraw],
         encoder: &mut wgpu::CommandEncoder,
         frame_view: &wgpu::TextureView,
+        window_depth_view: Option<&wgpu::TextureView>,
+        window_depth_format: Option<wgpu::TextureFormat>,
+        clear_window_depth: bool,
         viewport_width: u32,
         viewport_height: u32,
     ) -> u32 {
@@ -360,6 +363,20 @@ impl WgpuCustomDrawRegistry {
         let textures = self.textures.lock().clone();
         let samplers = self.samplers.lock().clone();
 
+        let depth_stencil_attachment =
+            window_depth_view.map(|depth_view| wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: if clear_window_depth {
+                        wgpu::LoadOp::Clear(1.0)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            });
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("custom_draw_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -371,7 +388,7 @@ impl WgpuCustomDrawRegistry {
                 },
                 depth_slice: None,
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment,
             ..Default::default()
         });
 
@@ -386,7 +403,7 @@ impl WgpuCustomDrawRegistry {
             &mut pass,
             &color_formats,
             1,
-            None,
+            window_depth_format,
             Some((viewport_width, viewport_height)),
             &mut temporary_buffers,
         );
