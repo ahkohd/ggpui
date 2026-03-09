@@ -6,10 +6,10 @@ use gpui::{
     CustomDepthFormat, CustomDepthTargetDesc, CustomDepthTargetId, CustomDraw, CustomDrawRegistry,
     CustomDrawResourceStats, CustomFilterMode, CustomFrameDiagnostics, CustomFrontFace,
     CustomGpuFrameProfile, CustomIndexBuffer, CustomIndexFormat, CustomPipelineDesc,
-    CustomPipelineId, CustomPrimitiveTopology, CustomRenderTargetDesc, CustomSamplerDesc,
-    CustomSamplerId, CustomTextureBufferUpdate, CustomTextureDesc, CustomTextureDimension,
-    CustomTextureFormat, CustomTextureId, CustomTextureUpdate, CustomTextureUsage,
-    CustomVertexFetch, CustomVertexFormat, Result, ScaledPixels,
+    CustomPipelineId, CustomPrimitiveTopology, CustomPushConstantsDesc, CustomRenderTargetDesc,
+    CustomSamplerDesc, CustomSamplerId, CustomTextureBufferUpdate, CustomTextureDesc,
+    CustomTextureDimension, CustomTextureFormat, CustomTextureId, CustomTextureUpdate,
+    CustomTextureUsage, CustomVertexFetch, CustomVertexFormat, Result, ScaledPixels,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -88,6 +88,12 @@ struct WgpuCustomProfilingState {
 #[derive(Clone, Copy)]
 struct BindingInfo {
     kind: CustomBindingKind,
+    slot: CustomBindingSlot,
+}
+
+struct PushConstantsInfo {
+    name: &'static str,
+    size: u32,
     slot: CustomBindingSlot,
 }
 
@@ -1190,11 +1196,6 @@ impl WgpuCustomDrawRegistry {
     }
 
     fn create_render_pipeline(&self, desc: CustomPipelineDesc) -> Result<WgpuCustomPipeline> {
-        if desc.push_constants.is_some() {
-            return Err(anyhow!(
-                "custom draw push constants are not yet supported on wgpu"
-            ));
-        }
         if desc.state.sample_count == 0
             || desc.state.sample_count > MAX_SAMPLE_COUNT
             || !desc.state.sample_count.is_power_of_two()
@@ -1259,10 +1260,41 @@ impl WgpuCustomDrawRegistry {
                 )
             })?;
 
+        let push_constants_slot = push_constants_slot(&desc.bindings);
+        let push_constants = apply_push_constants(
+            &mut module,
+            &info,
+            &[vertex_entry_index, fragment_entry_index],
+            desc.push_constants,
+            push_constants_slot,
+        )?;
+        if push_constants.is_some() {
+            info = naga::valid::Validator::new(validator_flags, naga::valid::Capabilities::empty())
+                .validate(&module)
+                .map_err(|error| anyhow!("custom draw WGSL validation failed: {error}"))?;
+        }
+
         let attribute_locations = build_attribute_locations(&desc.vertex_fetches)?;
         assign_vertex_locations(&mut module, vertex_entry_index, &attribute_locations)?;
 
-        let (bindings_by_name, bindings_by_slot) = build_binding_maps(&desc.bindings);
+        let (mut bindings_by_name, bindings_by_slot) = build_binding_maps(&desc.bindings);
+        if let Some(push_constants) = &push_constants {
+            if bindings_by_name.contains_key(push_constants.name) {
+                return Err(anyhow!(
+                    "custom draw push constants name '{}' conflicts with a binding name",
+                    push_constants.name
+                ));
+            }
+            bindings_by_name.insert(
+                push_constants.name,
+                BindingInfo {
+                    kind: CustomBindingKind::Uniform {
+                        size: push_constants.size,
+                    },
+                    slot: push_constants.slot,
+                },
+            );
+        }
         let vertex_entry_name = module.entry_points[vertex_entry_index].name.clone();
         let fragment_entry_name = module.entry_points[fragment_entry_index].name.clone();
 
@@ -1316,7 +1348,8 @@ impl WgpuCustomDrawRegistry {
                 source: wgpu::ShaderSource::Wgsl(rewritten_wgsl.into()),
             });
 
-        let mut binding_specs = Vec::with_capacity(desc.bindings.len());
+        let mut binding_specs =
+            Vec::with_capacity(desc.bindings.len() + usize::from(push_constants.is_some()));
         let mut bind_group_layout_entries_by_group: Vec<Vec<wgpu::BindGroupLayoutEntry>> =
             Vec::new();
 
@@ -1348,6 +1381,35 @@ impl WgpuCustomDrawRegistry {
                             .copied(),
                     )?,
                     count: binding_array_count(binding.kind),
+                },
+            );
+        }
+
+        if let Some(push_constants) = &push_constants {
+            binding_specs.push(WgpuBindingSpec {
+                kind: CustomBindingKind::Uniform {
+                    size: push_constants.size,
+                },
+                slot: push_constants.slot,
+            });
+
+            if bind_group_layout_entries_by_group.len() <= push_constants.slot.group as usize {
+                bind_group_layout_entries_by_group
+                    .resize_with(push_constants.slot.group as usize + 1, Vec::new);
+            }
+
+            bind_group_layout_entries_by_group[push_constants.slot.group as usize].push(
+                wgpu::BindGroupLayoutEntry {
+                    binding: push_constants.slot.binding,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: map_binding_type(
+                        CustomBindingKind::Uniform {
+                            size: push_constants.size,
+                        },
+                        None,
+                        None,
+                    )?,
+                    count: None,
                 },
             );
         }
@@ -1500,12 +1562,6 @@ impl WgpuCustomDrawRegistry {
         &self,
         desc: CustomComputePipelineDesc,
     ) -> Result<WgpuCustomComputePipeline> {
-        if desc.push_constants.is_some() {
-            return Err(anyhow!(
-                "custom compute push constants are not yet supported on wgpu"
-            ));
-        }
-
         let device_features = self.device.features();
         for binding in &desc.bindings {
             match binding.kind {
@@ -1546,7 +1602,38 @@ impl WgpuCustomDrawRegistry {
             })
             .ok_or_else(|| anyhow!("custom compute entry '{}' not found", desc.entry_point))?;
 
-        let (bindings_by_name, bindings_by_slot) = build_binding_maps(&desc.bindings);
+        let push_constants_slot = push_constants_slot(&desc.bindings);
+        let push_constants = apply_push_constants(
+            &mut module,
+            &info,
+            &[compute_entry_index],
+            desc.push_constants,
+            push_constants_slot,
+        )?;
+        if push_constants.is_some() {
+            info = naga::valid::Validator::new(validator_flags, naga::valid::Capabilities::empty())
+                .validate(&module)
+                .map_err(|error| anyhow!("custom compute WGSL validation failed: {error}"))?;
+        }
+
+        let (mut bindings_by_name, bindings_by_slot) = build_binding_maps(&desc.bindings);
+        if let Some(push_constants) = &push_constants {
+            if bindings_by_name.contains_key(push_constants.name) {
+                return Err(anyhow!(
+                    "custom compute push constants name '{}' conflicts with a binding name",
+                    push_constants.name
+                ));
+            }
+            bindings_by_name.insert(
+                push_constants.name,
+                BindingInfo {
+                    kind: CustomBindingKind::Uniform {
+                        size: push_constants.size,
+                    },
+                    slot: push_constants.slot,
+                },
+            );
+        }
         let compute_entry_name = module.entry_points[compute_entry_index].name.clone();
 
         assign_resource_bindings(
@@ -1581,7 +1668,8 @@ impl WgpuCustomDrawRegistry {
                 source: wgpu::ShaderSource::Wgsl(rewritten_wgsl.into()),
             });
 
-        let mut binding_specs = Vec::with_capacity(desc.bindings.len());
+        let mut binding_specs =
+            Vec::with_capacity(desc.bindings.len() + usize::from(push_constants.is_some()));
         let mut bind_group_layout_entries_by_group: Vec<Vec<wgpu::BindGroupLayoutEntry>> =
             Vec::new();
 
@@ -1615,6 +1703,35 @@ impl WgpuCustomDrawRegistry {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: binding_type,
                     count: binding_array_count(binding.kind),
+                },
+            );
+        }
+
+        if let Some(push_constants) = &push_constants {
+            binding_specs.push(WgpuBindingSpec {
+                kind: CustomBindingKind::Uniform {
+                    size: push_constants.size,
+                },
+                slot: push_constants.slot,
+            });
+
+            if bind_group_layout_entries_by_group.len() <= push_constants.slot.group as usize {
+                bind_group_layout_entries_by_group
+                    .resize_with(push_constants.slot.group as usize + 1, Vec::new);
+            }
+
+            bind_group_layout_entries_by_group[push_constants.slot.group as usize].push(
+                wgpu::BindGroupLayoutEntry {
+                    binding: push_constants.slot.binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: map_binding_type(
+                        CustomBindingKind::Uniform {
+                            size: push_constants.size,
+                        },
+                        None,
+                        None,
+                    )?,
+                    count: None,
                 },
             );
         }
@@ -2936,6 +3053,96 @@ fn build_attribute_locations(
     }
 
     Ok(locations)
+}
+
+fn push_constants_slot(bindings: &[CustomBindingDesc]) -> CustomBindingSlot {
+    let mut max_group = 0u32;
+    for binding in bindings {
+        let slot = binding.slot.unwrap_or(CustomBindingSlot {
+            group: 0,
+            binding: binding.name.index(),
+        });
+        max_group = max_group.max(slot.group);
+    }
+
+    CustomBindingSlot {
+        group: max_group.saturating_add(1),
+        binding: 0,
+    }
+}
+
+fn apply_push_constants(
+    module: &mut naga::Module,
+    info: &naga::valid::ModuleInfo,
+    entry_indices: &[usize],
+    push_constants: Option<CustomPushConstantsDesc>,
+    slot: CustomBindingSlot,
+) -> Result<Option<PushConstantsInfo>> {
+    let mut push_constant_handle = None;
+    for (handle, variable) in module.global_variables.iter() {
+        if variable.space != naga::AddressSpace::Immediate {
+            continue;
+        }
+
+        let used = entry_indices.iter().any(|entry_index| {
+            let entry_info = info.get_entry_point(*entry_index);
+            !entry_info[handle].is_empty()
+        });
+        if !used {
+            continue;
+        }
+
+        if push_constant_handle.is_some() {
+            return Err(anyhow!(
+                "custom draw shaders may declare at most one push constants block"
+            ));
+        }
+        push_constant_handle = Some(handle);
+    }
+
+    let Some(handle) = push_constant_handle else {
+        if push_constants.is_some() {
+            return Err(anyhow!(
+                "push constants were provided but the shader has no push constant block"
+            ));
+        }
+        return Ok(None);
+    };
+
+    let push_constants = push_constants
+        .ok_or_else(|| anyhow!("shader declares push constants but none were provided"))?;
+
+    let mut layouter = naga::proc::Layouter::default();
+    layouter
+        .update(module.to_ctx())
+        .map_err(|error| anyhow!("push constants layout failed: {error}"))?;
+    let layout = &layouter[module.global_variables[handle].ty];
+
+    if layout.size != push_constants.size {
+        return Err(anyhow!(
+            "push constants size mismatch (expected {}, shader reports {})",
+            push_constants.size,
+            layout.size
+        ));
+    }
+
+    let variable = module.global_variables.get_mut(handle);
+    variable.space = naga::AddressSpace::Uniform;
+    variable.binding = None;
+    if variable.name.is_none() {
+        variable.name = Some("push_constants".to_string());
+    }
+
+    let name = variable
+        .name
+        .clone()
+        .unwrap_or_else(|| "push_constants".to_string());
+
+    Ok(Some(PushConstantsInfo {
+        name: Box::leak(name.into_boxed_str()),
+        size: push_constants.size,
+        slot,
+    }))
 }
 
 fn build_binding_maps(
