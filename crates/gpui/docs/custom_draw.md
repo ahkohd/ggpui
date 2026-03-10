@@ -40,6 +40,7 @@ Run from `crates/gpui` package context:
 ```sh
 cargo run -p gpui --example custom_draw_api
 cargo run -p gpui --example custom_draw_api_animated
+cargo run -p gpui --example custom_draw_api_rounded_clip
 cargo run -p gpui --example custom_draw_api_instanced
 cargo run -p gpui --example custom_draw_api_compute
 cargo run -p gpui --example custom_draw_api_offscreen
@@ -72,6 +73,37 @@ Optional visual state-leak guard test (macOS):
 
 ```sh
 cargo test -p gpui_platform --features "test-support,visual-test-guard" --test window_depth_state_leak_guard -- --nocapture
+```
+
+## Rounded corner clipping (opt-in)
+
+Custom draw uses the current rectangular content mask for clipping. Parent corner radii are not
+applied to canvas/custom-draw output automatically.
+
+Use an opt-in shader helper when you need rounded clipping:
+
+```wgsl
+struct RoundedClipUniform {
+  rect_size: vec2<f32>,
+  corner_radius: f32,
+  clip_enabled: f32,
+};
+
+fn rounded_rect_alpha(local_position: vec2<f32>, rect_size: vec2<f32>, corner_radius: f32) -> f32 {
+  let half_size = rect_size * 0.5;
+  let limited_corner_radius = clamp(corner_radius, 0.0, min(half_size.x, half_size.y));
+  let centered_position = local_position - half_size;
+  let q = abs(centered_position) - (half_size - vec2<f32>(limited_corner_radius, limited_corner_radius));
+  let signed_distance = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - limited_corner_radius;
+  let antialias_pixels = max(fwidth(signed_distance), 0.75);
+  return 1.0 - smoothstep(0.0, antialias_pixels, signed_distance);
+}
+```
+
+Example (side-by-side default vs helper):
+
+```sh
+cargo run -p gpui --example custom_draw_api_rounded_clip
 ```
 
 ## Runtime compressed-format selection
@@ -117,6 +149,7 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 - Depth format support is currently `Depth32Float`.
 - Window-target custom draws support single-sample depth testing (`Depth32Float`).
 - Window-surface rendering uses one sample. MSAA is for offscreen targets.
+- Canvas/custom-draw clipping uses rectangular content masks; rounded clipping is opt-in in shader code (see `custom_draw_api_rounded_clip`).
 - Binding-array support through WGSL to MSL currently works for texture arrays.
 - Buffer binding arrays in WGSL to MSL remain limited by translator support. Use precompiled MSL or `.metallib` when needed.
 - GPU timestamp and frame diagnostics samples are sourced from Metal command buffer timing and callbacks.
