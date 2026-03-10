@@ -51,8 +51,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     default: { pos = vec2<f32>(-0.5, 0.5); }
   }
 
-  let wobble = 0.08 * sin(push_constants.phase + f32(index) * 0.7);
-  b0[index] = pos * b1.viewport.z + vec2<f32>(wobble, -wobble);
+  let offset = 0.08 * sin(push_constants.phase);
+  b0[index] = pos * b1.viewport.z + vec2<f32>(offset, -offset);
 }
 "#;
 
