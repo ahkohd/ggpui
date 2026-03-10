@@ -40,6 +40,7 @@ Run from `crates/gpui` package context:
 ```sh
 cargo run -p gpui --example custom_draw_api
 cargo run -p gpui --example custom_draw_api_animated
+cargo run -p gpui --features bevy-ecs-example --example custom_draw_api_bevy_ecs
 cargo run -p gpui --example custom_draw_api_rounded_clip
 cargo run -p gpui --example custom_draw_api_instanced
 cargo run -p gpui --example custom_draw_api_compute
@@ -156,3 +157,4 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 - `gpui_wgpu` currently supports window-target (single-sample color + optional `Depth32Float`) and offscreen render pipelines (multiple color targets, `Depth32Float`, MSAA), custom compute pipelines with buffer/texture/sampler/uniform bindings, push constants (via WGSL rewrite to a generated uniform binding), explicit group/binding slots, binding arrays (buffer/texture/storage-texture arrays when required wgpu features are available), buffer-backed texture uploads (including compressed formats with block-aligned rows), sampled `D2`/`D2Array`/`Cube` textures, sampled compressed textures (BC/ETC2/ASTC when available), 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`) in render/compute bindings, and per-frame profiling/diagnostics counters (including queue submit-to-complete latency, timestamp-query GPU time when the adapter supports `TIMESTAMP_QUERY`, and derived submit/scheduled timing fields).
 - Remaining non-parity items on `gpui_wgpu`: Metal-only pipeline input APIs (`create_pipeline_msl`, `create_pipeline_metallib(_file)`, pipeline cache path), PVRTC texture formats, and feature-dependent behavior when adapters do not expose required wgpu features.
 - `custom_draw_api_video` requires enabling `video-ffmpeg` and installing FFmpeg development libraries/tooling (`pkg-config`/`vcpkg` plus `libavcodec`, `libavformat`, and `libswscale`).
+- `custom_draw_api_bevy_ecs` requires enabling `bevy-ecs-example`.
