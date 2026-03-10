@@ -2543,6 +2543,8 @@ struct MetalTextureFormatInfo {
 fn metal_texture_format_info(format: CustomTextureFormat) -> MetalTextureFormatInfo {
     let block_info = format.block_info();
     let pixel_format = match format {
+        CustomTextureFormat::R8Unorm => metal::MTLPixelFormat::R8Unorm,
+        CustomTextureFormat::Rg8Unorm => metal::MTLPixelFormat::RG8Unorm,
         CustomTextureFormat::Rgba8Unorm => metal::MTLPixelFormat::RGBA8Unorm,
         CustomTextureFormat::Bgra8Unorm => metal::MTLPixelFormat::BGRA8Unorm,
         CustomTextureFormat::Rgba8UnormSrgb => metal::MTLPixelFormat::RGBA8Unorm_sRGB,

@@ -56,9 +56,17 @@ cargo run -p gpui --example custom_draw_api_cubemap
 cargo run -p gpui --example custom_draw_api_storage_texture
 cargo run -p gpui --example custom_draw_api_streaming_texture
 cargo run -p gpui --example custom_draw_api_compressed_texture
+# defaults to bundled bird_60fps.mp4 asset:
+cargo run -p gpui --features video-ffmpeg --example custom_draw_api_video
+# override with your own file:
+cargo run -p gpui --features video-ffmpeg --example custom_draw_api_video -- --video /path/to/video.mp4
+# force software decode path (disable hardware-accelerated decode):
+cargo run -p gpui --features video-ffmpeg --example custom_draw_api_video -- --software
 cargo run -p gpui --example custom_draw_api_metallib
 cargo run -p gpui --example custom_draw_stress
 ```
+
+The `custom_draw_api_video` window includes media controls (play/pause, restart, loop toggle), a seek scrubber, and current-time/total-duration display (including an in-video overlay).
 
 Optional visual state-leak guard test (macOS):
 
@@ -114,3 +122,4 @@ let id = window.create_custom_pipeline_metallib_file(desc, "path/to/custom.metal
 - GPU timestamp and frame diagnostics samples are sourced from Metal command buffer timing and callbacks.
 - `gpui_wgpu` currently supports window-target (single-sample color + optional `Depth32Float`) and offscreen render pipelines (multiple color targets, `Depth32Float`, MSAA), custom compute pipelines with buffer/texture/sampler/uniform bindings, push constants (via WGSL rewrite to a generated uniform binding), explicit group/binding slots, binding arrays (buffer/texture/storage-texture arrays when required wgpu features are available), buffer-backed texture uploads (including compressed formats with block-aligned rows), sampled `D2`/`D2Array`/`Cube` textures, sampled compressed textures (BC/ETC2/ASTC when available), 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`) in render/compute bindings, and per-frame profiling/diagnostics counters (including queue submit-to-complete latency, timestamp-query GPU time when the adapter supports `TIMESTAMP_QUERY`, and derived submit/scheduled timing fields).
 - Remaining non-parity items on `gpui_wgpu`: Metal-only pipeline input APIs (`create_pipeline_msl`, `create_pipeline_metallib(_file)`, pipeline cache path), PVRTC texture formats, and feature-dependent behavior when adapters do not expose required wgpu features.
+- `custom_draw_api_video` requires enabling `video-ffmpeg` and installing FFmpeg development libraries/tooling (`pkg-config`/`vcpkg` plus `libavcodec`, `libavformat`, and `libswscale`).

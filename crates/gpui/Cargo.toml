@@ -36,6 +36,7 @@ screen-capture = [
     "scap",
 ]
 windows-manifest = ["dep:embed-resource"]
+video-ffmpeg = ["dep:ffmpeg-next"]
 
 [lib]
 path = "src/gpui.rs"
@@ -51,6 +52,7 @@ collections.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
 etagere = "0.2"
+ffmpeg-next = { version = "8.0.0", optional = true }
 futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true

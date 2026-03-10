@@ -862,6 +862,8 @@ mod tests {
 
     #[test]
     fn uncompressed_formats_are_not_marked_compressed() {
+        assert!(!CustomTextureFormat::R8Unorm.is_compressed());
+        assert!(!CustomTextureFormat::Rg8Unorm.is_compressed());
         assert!(!CustomTextureFormat::Rgba8Unorm.is_compressed());
         assert!(!CustomTextureFormat::Bgra8Unorm.is_compressed());
         assert!(!CustomTextureFormat::Rgba8UnormSrgb.is_compressed());
@@ -1070,6 +1072,10 @@ impl CustomBindingValue {
 /// Texture formats supported by custom draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomTextureFormat {
+    /// R8 unorm.
+    R8Unorm,
+    /// RG8 unorm.
+    Rg8Unorm,
     /// RGBA8 unorm.
     Rgba8Unorm,
     /// BGRA8 unorm.
@@ -1145,6 +1151,16 @@ impl CustomTextureFormat {
     /// Returns block width/height and byte size for this format.
     pub const fn block_info(self) -> CustomTexelBlockInfo {
         match self {
+            CustomTextureFormat::R8Unorm => CustomTexelBlockInfo {
+                width: 1,
+                height: 1,
+                bytes: 1,
+            },
+            CustomTextureFormat::Rg8Unorm => CustomTexelBlockInfo {
+                width: 1,
+                height: 1,
+                bytes: 2,
+            },
             CustomTextureFormat::Rgba8Unorm
             | CustomTextureFormat::Bgra8Unorm
             | CustomTextureFormat::Rgba8UnormSrgb

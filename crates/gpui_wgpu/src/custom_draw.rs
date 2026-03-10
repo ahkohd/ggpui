@@ -2814,6 +2814,8 @@ fn binding_kind_required_features(kind: CustomBindingKind) -> wgpu::Features {
 
 fn map_texture_format(format: CustomTextureFormat) -> Option<wgpu::TextureFormat> {
     match format {
+        CustomTextureFormat::R8Unorm => Some(wgpu::TextureFormat::R8Unorm),
+        CustomTextureFormat::Rg8Unorm => Some(wgpu::TextureFormat::Rg8Unorm),
         CustomTextureFormat::Rgba8Unorm => Some(wgpu::TextureFormat::Rgba8Unorm),
         CustomTextureFormat::Bgra8Unorm => Some(wgpu::TextureFormat::Bgra8Unorm),
         CustomTextureFormat::Rgba8UnormSrgb => Some(wgpu::TextureFormat::Rgba8UnormSrgb),
