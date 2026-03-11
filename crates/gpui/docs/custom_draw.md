@@ -1,6 +1,6 @@
 # Custom Draw
 
-Custom draw is implemented on the macOS Metal backend and has partial support on `gpui_wgpu` renderers.
+Custom draw is implemented on the macOS Metal backend and on `gpui_wgpu` renderers, with a few documented backend-specific gaps on `gpui_wgpu`.
 
 On backends without a custom draw registry, API entry points return an explicit error such as:
 
@@ -12,7 +12,7 @@ On backends without a custom draw registry, API entry points return an explicit 
 | Backend | Status | Notes |
 | --- | --- | --- |
 | macOS (`gpui_macos`, Metal renderer) | Implemented | Supports window-target and offscreen custom render pipelines (multiple color targets, `Depth32Float`, MSAA for offscreen), custom compute pipelines, push constants, compressed texture uploads, explicit slots, binding arrays, profiling/diagnostics timing fields, and Metal-only pipeline inputs (`MSL` source / `.metallib` / pipeline cache path) |
-| `gpui_wgpu` renderer backends | Partial | Supports window-target custom render pipelines (single-sample color + optional `Depth32Float` depth), offscreen render pipelines (multiple color targets, `Depth32Float`, MSAA), custom compute pipelines with buffer/texture/sampler/uniform bindings, push constants (via WGSL rewrite to a generated uniform binding), buffer-backed texture uploads (including compressed formats with block-aligned rows), sampled `D2`/`D2Array`/`Cube` textures, 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`) in render/compute bindings, sampled compressed textures (BC/ETC2/ASTC when device features are available), explicit group/binding slots, binding arrays (buffer/texture/storage-texture arrays when required wgpu features are available), and per-frame profiling/diagnostics counters (including queue submit-to-complete latency, timestamp-query GPU time when supported, and derived submit/scheduled timing fields). Metal-only pipeline input APIs and PVRTC remain unsupported |
+| `gpui_wgpu` renderer backends | Implemented (with gaps) | Supports window-target custom render pipelines (single-sample color + optional `Depth32Float` depth), offscreen render pipelines (multiple color targets, `Depth32Float`, MSAA), custom compute pipelines with buffer/texture/sampler/uniform bindings, push constants (via WGSL rewrite to a generated uniform binding), buffer-backed texture uploads (including compressed formats with block-aligned rows), sampled `D2`/`D2Array`/`Cube` textures, 2D storage textures (`Rgba8Unorm`/`Bgra8Unorm`) in render/compute bindings, sampled compressed textures (BC/ETC2/ASTC when device features are available), explicit group/binding slots, binding arrays (buffer/texture/storage-texture arrays when required wgpu features are available), and per-frame profiling/diagnostics counters (including queue submit-to-complete latency, timestamp-query GPU time when supported, and derived submit/scheduled timing fields). Metal-only pipeline input APIs and PVRTC remain unsupported |
 
 ## Features
 
