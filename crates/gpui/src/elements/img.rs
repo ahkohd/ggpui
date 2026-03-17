@@ -475,12 +475,13 @@ impl Element for Img {
                         .to_pixels(window.rem_size())
                         .clamp_radii_for_quad_size(new_bounds.size);
                     window
-                        .paint_image(
+                        .paint_image_with_corner_superellipse(
                             new_bounds,
                             corner_radii,
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            style.smoothness.unwrap_or(0.0),
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
