@@ -523,6 +523,7 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                content_mask: path.content_mask,
             }));
         }
 
@@ -1148,6 +1149,7 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Clone, Copy)]

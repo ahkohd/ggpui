@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, custom_draw::WgpuCustomDrawRegistry};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, Edges, GpuSpecs,
+    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -23,7 +23,7 @@ struct GlobalParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct PodBounds {
     origin: [f32; 2],
     size: [f32; 2],
@@ -39,10 +39,46 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PodEdges {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+impl From<Edges<ScaledPixels>> for PodEdges {
+    fn from(edges: Edges<ScaledPixels>) -> Self {
+        Self {
+            top: edges.top.0,
+            right: edges.right.0,
+            bottom: edges.bottom.0,
+            left: edges.left.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PodContentMask {
+    bounds: PodBounds,
+    fade_out: PodEdges,
+}
+
+impl From<ContentMask<ScaledPixels>> for PodContentMask {
+    fn from(content_mask: ContentMask<ScaledPixels>) -> Self {
+        Self {
+            bounds: content_mask.bounds.into(),
+            fade_out: content_mask.fade_out.into(),
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    content_mask: PodContentMask,
 }
 
 #[repr(C)]
@@ -67,6 +103,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask: PodContentMask,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1642,11 +1679,13 @@ impl WgpuRenderer {
         let mut vertices = Vec::new();
         for path in paths {
             let bounds = path.clipped_bounds();
+            let content_mask: PodContentMask = path.content_mask.clone().into();
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask,
             }));
         }
 

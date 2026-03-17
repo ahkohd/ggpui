@@ -1469,11 +1469,15 @@ pub struct DispatchEventResult {
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
 /// to leave room to support more complex shapes in the future.
+///
+/// `fade_out` is evaluated in window space against these axis-aligned bounds and is not transform-aware.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// Edge fade distances. `0` means no fade for that edge.
+    pub fade_out: Edges<P>,
 }
 
 impl ContentMask<Pixels> {
@@ -1481,13 +1485,193 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            fade_out: self.fade_out.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+
+        let left = if self.bounds.left() > other.bounds.left() {
+            self.fade_out.left
+        } else if other.bounds.left() > self.bounds.left() {
+            other.fade_out.left
+        } else {
+            self.fade_out.left.max(other.fade_out.left)
+        };
+
+        let top = if self.bounds.top() > other.bounds.top() {
+            self.fade_out.top
+        } else if other.bounds.top() > self.bounds.top() {
+            other.fade_out.top
+        } else {
+            self.fade_out.top.max(other.fade_out.top)
+        };
+
+        let right = if self.bounds.right() < other.bounds.right() {
+            self.fade_out.right
+        } else if other.bounds.right() < self.bounds.right() {
+            other.fade_out.right
+        } else {
+            self.fade_out.right.max(other.fade_out.right)
+        };
+
+        let bottom = if self.bounds.bottom() < other.bounds.bottom() {
+            self.fade_out.bottom
+        } else if other.bounds.bottom() < self.bounds.bottom() {
+            other.fade_out.bottom
+        } else {
+            self.fade_out.bottom.max(other.fade_out.bottom)
+        };
+
+        let max_x = bounds.size.width.max(Pixels::ZERO);
+        let max_y = bounds.size.height.max(Pixels::ZERO);
+        let mut top = top.clamp(Pixels::ZERO, max_y);
+        let mut right = right.clamp(Pixels::ZERO, max_x);
+        let mut bottom = bottom.clamp(Pixels::ZERO, max_y);
+        let mut left = left.clamp(Pixels::ZERO, max_x);
+        let normalize_pair = |start: Pixels, end: Pixels, max: Pixels| {
+            let total = start + end;
+            if total > max && total > Pixels::ZERO {
+                let scale = max.0 / total.0;
+                (start * scale, end * scale)
+            } else {
+                (start, end)
+            }
+        };
+        (left, right) = normalize_pair(left, right, max_x);
+        (top, bottom) = normalize_pair(top, bottom, max_y);
+        let fade_out = Edges {
+            top,
+            right,
+            bottom,
+            left,
+        };
+        ContentMask { bounds, fade_out }
+    }
+}
+
+#[cfg(test)]
+mod content_mask_tests {
+    use super::*;
+
+    fn mask(
+        origin_x: f32,
+        origin_y: f32,
+        width: f32,
+        height: f32,
+        fade_out: Edges<Pixels>,
+    ) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds {
+                origin: point(px(origin_x), px(origin_y)),
+                size: size(px(width), px(height)),
+            },
+            fade_out,
+        }
+    }
+
+    #[test]
+    fn intersect_drops_fade_when_that_edge_is_not_part_of_resulting_bounds() {
+        let outer = mask(
+            0.,
+            0.,
+            100.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(20.),
+            },
+        );
+        let inner = mask(
+            30.,
+            0.,
+            40.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(0.),
+            },
+        );
+
+        let combined = outer.intersect(&inner);
+        assert_eq!(combined.bounds.left(), px(30.));
+        assert_eq!(combined.fade_out.left, px(0.));
+    }
+
+    #[test]
+    fn intersect_keeps_fade_from_mask_that_defines_resulting_edge() {
+        let parent = mask(
+            0.,
+            0.,
+            200.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(16.),
+            },
+        );
+        let child = mask(
+            0.,
+            0.,
+            120.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(8.),
+            },
+        );
+
+        let combined = parent.intersect(&child);
+        assert_eq!(combined.bounds.left(), px(0.));
+        assert_eq!(combined.fade_out.left, px(16.));
+    }
+
+    #[test]
+    fn intersect_clamps_fade_to_resulting_bounds() {
+        let a = mask(
+            0.,
+            0.,
+            40.,
+            40.,
+            Edges {
+                top: px(200.),
+                right: px(200.),
+                bottom: px(200.),
+                left: px(200.),
+            },
+        );
+        let b = mask(
+            10.,
+            10.,
+            5.,
+            5.,
+            Edges {
+                top: px(200.),
+                right: px(200.),
+                bottom: px(200.),
+                left: px(200.),
+            },
+        );
+
+        let combined = a.intersect(&b);
+        assert_eq!(combined.bounds.size.width, px(5.));
+        assert_eq!(combined.bounds.size.height, px(5.));
+        assert_eq!(combined.fade_out.left + combined.fade_out.right, px(5.));
+        assert_eq!(combined.fade_out.top + combined.fade_out.bottom, px(5.));
+        assert_eq!(combined.fade_out.left, px(2.5));
+        assert_eq!(combined.fade_out.right, px(2.5));
+        assert_eq!(combined.fade_out.top, px(2.5));
+        assert_eq!(combined.fade_out.bottom, px(2.5));
     }
 }
 
@@ -2847,6 +3031,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                fade_out: Edges::default(),
             })
     }
 
@@ -3139,6 +3324,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
+            smoothness: quad.smoothness.clamp(0.0, 1.0),
+            pad: 0,
         });
     }
 
@@ -3377,6 +3564,10 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                smoothness: 0.0,
+                pad2: 0,
+                pad3: 0,
+                pad4: 0,
             });
         }
         Ok(())
@@ -3459,6 +3650,27 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_corner_superellipse(
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            0.0,
+        )
+    }
+
+    /// Paint an image with superellipse corners.
+    /// amount: 0.0 = circular corners, 0.5 = squircle, 1.0 = square-ish corners.
+    pub fn paint_image_with_corner_superellipse(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        amount: f32,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -3495,6 +3707,10 @@ impl Window {
             corner_radii,
             tile,
             opacity,
+            smoothness: amount.clamp(0.0, 1.0),
+            pad2: 0,
+            pad3: 0,
+            pad4: 0,
         });
         Ok(())
     }
@@ -5825,6 +6041,8 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// The smoothness of the corners (0.0 = circle, 0.5 = squircle, 1.0 = square).
+    pub smoothness: f32,
 }
 
 impl PaintQuad {
@@ -5859,6 +6077,14 @@ impl PaintQuad {
             ..self
         }
     }
+
+    /// Sets superellipse corner amount (0.0 = circular, 0.5 = squircle, 1.0 = square-ish).
+    pub fn corner_superellipse(self, amount: f32) -> Self {
+        PaintQuad {
+            smoothness: amount.clamp(0.0, 1.0),
+            ..self
+        }
+    }
 }
 
 /// Creates a quad with the given parameters.
@@ -5877,6 +6103,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        smoothness: 0.0,
     }
 }
 
@@ -5889,6 +6116,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        smoothness: 0.0,
     }
 }
 
@@ -5905,5 +6133,6 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        smoothness: 0.0,
     }
 }

@@ -196,6 +196,10 @@ name = "opacity"
 path = "examples/opacity.rs"
 
 [[example]]
+name = "overflow_fade"
+path = "examples/overflow_fade.rs"
+
+[[example]]
 name = "pattern"
 path = "examples/pattern.rs"
 
@@ -210,6 +214,10 @@ path = "examples/shadow.rs"
 [[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
+
+[[example]]
+name = "superellipse"
+path = "examples/superellipse.rs"
 
 [[example]]
 name = "tab_stop"

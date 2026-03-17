@@ -1,6 +1,6 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+    DefiniteLength, Display, Edges, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, Hsla, JustifyContent, Length, SharedString, StrikethroughStyle,
     StyleRefinement, TextAlign, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px,
     relative, rems,
@@ -121,6 +121,39 @@ pub trait Styled: Sized {
     /// [Docs](https://tailwindcss.com/docs/text-overflow#truncate)
     fn truncate(mut self) -> Self {
         self.overflow_hidden().whitespace_nowrap().text_ellipsis()
+    }
+
+    /// Sets per-edge fade distances for the overflow mask.
+    fn overflow_fade(mut self, fade: impl Into<Edges<AbsoluteLength>>) -> Self {
+        let fade = fade.into();
+        let overflow_fade = &mut self.style().overflow_fade;
+        overflow_fade.top = Some(fade.top);
+        overflow_fade.right = Some(fade.right);
+        overflow_fade.bottom = Some(fade.bottom);
+        overflow_fade.left = Some(fade.left);
+        self
+    }
+
+    /// Sets horizontal fade distances (left and right) for the overflow mask.
+    fn overflow_fade_x(mut self, fade: impl Into<AbsoluteLength>) -> Self {
+        let fade = fade.into();
+        let overflow_fade = &mut self.style().overflow_fade;
+        overflow_fade.top = Some(px(0.).into());
+        overflow_fade.right = Some(fade);
+        overflow_fade.bottom = Some(px(0.).into());
+        overflow_fade.left = Some(fade);
+        self
+    }
+
+    /// Sets vertical fade distances (top and bottom) for the overflow mask.
+    fn overflow_fade_y(mut self, fade: impl Into<AbsoluteLength>) -> Self {
+        let fade = fade.into();
+        let overflow_fade = &mut self.style().overflow_fade;
+        overflow_fade.top = Some(fade);
+        overflow_fade.right = Some(px(0.).into());
+        overflow_fade.bottom = Some(fade);
+        overflow_fade.left = Some(px(0.).into());
+        self
     }
 
     /// Sets number of lines to show before truncating the text.
@@ -760,6 +793,78 @@ pub trait Styled: Sized {
     #[cfg(debug_assertions)]
     fn debug_below(mut self) -> Self {
         self.style().debug_below = Some(true);
+        self
+    }
+
+    /// Sets superellipse corner amount (0.0 = circular, 0.5 = squircle, 1.0 = square-ish).
+    fn corner_superellipse(mut self, amount: f32) -> Self {
+        self.style().smoothness = Some(amount.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.0 (circular).
+    fn corner_superellipse_0(mut self) -> Self {
+        self.style().smoothness = Some(0.0);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.1.
+    fn corner_superellipse_0p1(mut self) -> Self {
+        self.style().smoothness = Some(0.1);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.2.
+    fn corner_superellipse_0p2(mut self) -> Self {
+        self.style().smoothness = Some(0.2);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.3.
+    fn corner_superellipse_0p3(mut self) -> Self {
+        self.style().smoothness = Some(0.3);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.4.
+    fn corner_superellipse_0p4(mut self) -> Self {
+        self.style().smoothness = Some(0.4);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.5 (squircle).
+    fn corner_superellipse_0p5(mut self) -> Self {
+        self.style().smoothness = Some(0.5);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.6.
+    fn corner_superellipse_0p6(mut self) -> Self {
+        self.style().smoothness = Some(0.6);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.7.
+    fn corner_superellipse_0p7(mut self) -> Self {
+        self.style().smoothness = Some(0.7);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.8.
+    fn corner_superellipse_0p8(mut self) -> Self {
+        self.style().smoothness = Some(0.8);
+        self
+    }
+
+    /// Sets corner superellipse amount to 0.9.
+    fn corner_superellipse_0p9(mut self) -> Self {
+        self.style().smoothness = Some(0.9);
+        self
+    }
+
+    /// Sets corner superellipse amount to 1.0 (square-ish).
+    fn corner_superellipse_1(mut self) -> Self {
+        self.style().smoothness = Some(1.0);
         self
     }
 }
