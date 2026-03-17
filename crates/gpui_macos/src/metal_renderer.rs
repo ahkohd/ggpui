@@ -1,5 +1,11 @@
-use crate::metal_atlas::MetalAtlas;
-use anyhow::Result;
+use crate::{
+    custom_draw::{
+        ArgumentBufferBinding, MetalBufferSnapshot, MetalCustomComputePipeline,
+        MetalCustomDrawRegistry, MetalCustomPipeline,
+    },
+    metal_atlas::MetalAtlas,
+};
+use anyhow::{Result, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     base::{NO, YES},
@@ -7,9 +13,11 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, CustomBindingKind, CustomBindingValue,
+    CustomBufferSource, CustomDraw, CustomFrameDiagnostics, CustomGpuFrameProfile,
+    CustomIndexBuffer, CustomIndexFormat, CustomTextureId, DevicePixels, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -27,7 +35,7 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{cell::Cell, collections::BTreeMap, ffi::c_void, mem, ptr, sync::Arc, time::Instant};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -123,13 +131,16 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    depth_disabled_state: metal::DepthStencilState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
+    custom_draw: Arc<MetalCustomDrawRegistry>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    window_custom_depth_texture: Option<metal::Texture>,
     path_sample_count: u32,
 }
 
@@ -291,9 +302,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let depth_disabled_state = create_depth_disabled_state(&device);
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+        let custom_draw = Arc::new(MetalCustomDrawRegistry::new(
+            device.clone(),
+            MTLPixelFormat::BGRA8Unorm,
+        ));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
@@ -312,12 +328,15 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            depth_disabled_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
+            custom_draw,
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            window_custom_depth_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -332,6 +351,10 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    pub fn custom_draw_registry(&self) -> Arc<dyn gpui::CustomDrawRegistry> {
+        self.custom_draw.clone()
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -356,6 +379,7 @@ impl MetalRenderer {
             height: DevicePixels(size.height as i32),
         };
         self.update_path_intermediate_textures(device_pixels_size);
+        self.update_window_custom_depth_texture(device_pixels_size);
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -396,6 +420,35 @@ impl MetalRenderer {
         }
     }
 
+    fn update_window_custom_depth_texture(&mut self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.window_custom_depth_texture = None;
+            return;
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::Depth32Float);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+
+        self.window_custom_depth_texture = Some(self.device.new_texture(&descriptor));
+    }
+
+    fn ensure_window_custom_depth_texture(&mut self, size: Size<DevicePixels>) {
+        let width = size.width.0.max(1) as u64;
+        let height = size.height.0.max(1) as u64;
+        let needs_resize = match self.window_custom_depth_texture.as_ref() {
+            Some(texture) => texture.width() != width || texture.height() != height,
+            None => true,
+        };
+
+        if needs_resize {
+            self.update_window_custom_depth_texture(size);
+        }
+    }
+
     pub fn update_transparency(&self, transparent: bool) {
         self.layer.set_opaque(!transparent);
     }
@@ -421,26 +474,113 @@ impl MetalRenderer {
             return;
         };
 
+        let frame_encode_start = Instant::now();
+        let mut retry_count = 0u32;
         loop {
             let mut instance_buffer = self
                 .instance_buffer_pool
                 .lock()
                 .acquire(&self.device, self.is_unified_memory);
+            let custom_gpu_profile = if self.custom_draw.gpu_profiling_enabled() {
+                build_custom_gpu_profile(scene)
+            } else {
+                None
+            };
+            let custom_frame_diagnostics = if self.custom_draw.frame_diagnostics_enabled() {
+                build_custom_frame_diagnostics(scene)
+            } else {
+                None
+            };
 
             let command_buffer =
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    let custom_draw = self.custom_draw.clone();
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
+                    let cpu_encode_time_ns =
+                        duration_as_u64_nanoseconds(frame_encode_start.elapsed());
+                    let custom_frame_diagnostics =
+                        custom_frame_diagnostics.map(|mut diagnostics| {
+                            diagnostics.retry_count = retry_count;
+                            diagnostics.cpu_encode_time_ns = cpu_encode_time_ns;
+                            diagnostics
+                        });
+                    let submit_instant = Arc::new(std::sync::Mutex::new(None::<Instant>));
+                    let scheduled_instant = Arc::new(std::sync::Mutex::new(None::<Instant>));
+
+                    if custom_frame_diagnostics.is_some() {
+                        let scheduled_instant = Arc::clone(&scheduled_instant);
+                        let scheduled_block = ConcreteBlock::new(move |_| {
+                            if let Ok(mut scheduled_value) = scheduled_instant.lock()
+                                && scheduled_value.is_none()
+                            {
+                                *scheduled_value = Some(Instant::now());
+                            }
+                        });
+                        let scheduled_block = scheduled_block.copy();
+                        command_buffer.add_scheduled_handler(&scheduled_block);
+                    }
+
+                    let completed_submit_instant = Arc::clone(&submit_instant);
+                    let completed_scheduled_instant = Arc::clone(&scheduled_instant);
+                    let block = ConcreteBlock::new(move |completed_command_buffer| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
+                        }
+
+                        let gpu_time_ns =
+                            metal_command_buffer_gpu_time_ns(completed_command_buffer);
+                        if let Some(mut custom_gpu_profile) = custom_gpu_profile {
+                            custom_gpu_profile.gpu_time_ns = gpu_time_ns;
+                            custom_draw.record_gpu_profile(custom_gpu_profile);
+                        }
+
+                        if let Some(mut custom_frame_diagnostics) = custom_frame_diagnostics {
+                            let completed_instant = Instant::now();
+                            let submit_instant = completed_submit_instant
+                                .lock()
+                                .ok()
+                                .and_then(|value| *value);
+                            let scheduled_instant = completed_scheduled_instant
+                                .lock()
+                                .ok()
+                                .and_then(|value| *value);
+
+                            custom_frame_diagnostics.gpu_time_ns = gpu_time_ns;
+                            custom_frame_diagnostics.submit_to_scheduled_ns = submit_instant
+                                .and_then(|submit| {
+                                    scheduled_instant.and_then(|scheduled| {
+                                        scheduled
+                                            .checked_duration_since(submit)
+                                            .map(duration_as_u64_nanoseconds)
+                                    })
+                                });
+                            custom_frame_diagnostics.submit_to_completed_ns = submit_instant
+                                .and_then(|submit| {
+                                    completed_instant
+                                        .checked_duration_since(submit)
+                                        .map(duration_as_u64_nanoseconds)
+                                });
+                            custom_frame_diagnostics.scheduled_to_completed_ns = scheduled_instant
+                                .and_then(|scheduled| {
+                                    completed_instant
+                                        .checked_duration_since(scheduled)
+                                        .map(duration_as_u64_nanoseconds)
+                                });
+                            custom_draw.record_frame_diagnostics(custom_frame_diagnostics);
                         }
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
+
+                    if custom_frame_diagnostics.is_some()
+                        && let Ok(mut submit_value) = submit_instant.lock()
+                    {
+                        *submit_value = Some(Instant::now());
+                    }
 
                     if self.presents_with_transaction {
                         command_buffer.commit();
@@ -453,6 +593,7 @@ impl MetalRenderer {
                     return;
                 }
                 Err(err) => {
+                    retry_count = retry_count.saturating_add(1);
                     log::error!(
                         "failed to render: {}. retrying with larger instance buffer size",
                         err
@@ -579,10 +720,28 @@ impl MetalRenderer {
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        self.ensure_window_custom_depth_texture(viewport_size);
+        let window_custom_depth_texture = self.window_custom_depth_texture.clone();
+
+        self.dispatch_custom_computes(
+            scene,
+            command_buffer,
+            instance_buffer,
+            &mut instance_offset,
+        )?;
+        self.draw_custom_render_targets(
+            scene,
+            command_buffer,
+            instance_buffer,
+            &mut instance_offset,
+        )?;
+
         let mut command_encoder = new_command_encoder(
             command_buffer,
             drawable,
             viewport_size,
+            window_custom_depth_texture.as_deref(),
+            metal::MTLLoadAction::Clear,
             |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
                 color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
@@ -621,6 +780,8 @@ impl MetalRenderer {
                         command_buffer,
                         drawable,
                         viewport_size,
+                        window_custom_depth_texture.as_deref(),
+                        metal::MTLLoadAction::Load,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
@@ -668,6 +829,12 @@ impl MetalRenderer {
                     instance_buffer,
                     &mut instance_offset,
                     viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Custom(range) => self.draw_custom_draws(
+                    &scene.custom_draws[range],
+                    instance_buffer,
+                    &mut instance_offset,
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
@@ -1309,10 +1476,1537 @@ impl MetalRenderer {
     }
 }
 
+impl MetalRenderer {
+    fn draw_custom_render_targets(
+        &mut self,
+        scene: &Scene,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> Result<()> {
+        struct RenderTargetInfo {
+            texture: metal::Texture,
+            msaa_texture: Option<metal::Texture>,
+            width: u32,
+            height: u32,
+            format: metal::MTLPixelFormat,
+            clear_color: [f32; 4],
+            is_render_target: bool,
+            sample_count: u32,
+        }
+
+        struct DepthTargetInfo {
+            texture: metal::Texture,
+            format: metal::MTLPixelFormat,
+            clear_depth: f64,
+            width: u32,
+            height: u32,
+            sample_count: u32,
+        }
+
+        let mut draws_by_target = BTreeMap::new();
+        for draw in scene.custom_draws.iter() {
+            let Some(target) = draw.target.as_ref() else {
+                continue;
+            };
+            let colors: Vec<u32> = target.colors.iter().map(|color| color.0).collect();
+            draws_by_target
+                .entry((colors, target.depth.map(|depth| depth.0)))
+                .or_insert_with(Vec::new)
+                .push(draw);
+        }
+        if draws_by_target.is_empty() {
+            return Ok(());
+        }
+
+        let buffers_snapshot = self.custom_draw.buffers_snapshot();
+        let textures_snapshot = self.custom_draw.textures_snapshot();
+        let samplers_snapshot = self.custom_draw.samplers_snapshot();
+
+        'render_target: for (_, draws) in draws_by_target {
+            let Some(target) = draws.first().and_then(|draw| draw.target.as_ref()) else {
+                continue;
+            };
+            let mut color_targets = Vec::with_capacity(target.colors.len());
+            for color_id in &target.colors {
+                let Some(color_target) =
+                    self.custom_draw
+                        .with_texture(*color_id, |entry| RenderTargetInfo {
+                            texture: entry.texture.clone(),
+                            msaa_texture: entry.msaa_texture.clone(),
+                            width: entry.width,
+                            height: entry.height,
+                            format: entry.format,
+                            clear_color: entry.clear_color,
+                            is_render_target: entry.is_render_target,
+                            sample_count: entry.sample_count,
+                        })
+                else {
+                    log::warn!("custom render target {:?} missing", color_id.0);
+                    continue 'render_target;
+                };
+                if !color_target.is_render_target {
+                    log::warn!("custom draw target {:?} is not a render target", color_id.0);
+                    continue 'render_target;
+                }
+                if color_target.sample_count > 1 && color_target.msaa_texture.is_none() {
+                    log::warn!("custom draw target {:?} missing MSAA texture", color_id.0);
+                    continue 'render_target;
+                }
+                color_targets.push(color_target);
+            }
+            let Some(first_target) = color_targets.first() else {
+                continue;
+            };
+            for target_info in &color_targets[1..] {
+                if target_info.width != first_target.width
+                    || target_info.height != first_target.height
+                {
+                    log::warn!("custom render targets must match in size");
+                    continue 'render_target;
+                }
+                if target_info.sample_count != first_target.sample_count {
+                    log::warn!("custom render targets must match in sample count");
+                    continue 'render_target;
+                }
+            }
+
+            let depth_target = if let Some(depth_id) = target.depth {
+                match self
+                    .custom_draw
+                    .with_depth_target(depth_id, |entry| DepthTargetInfo {
+                        texture: entry.texture.clone(),
+                        format: entry.format,
+                        clear_depth: entry.clear_depth,
+                        width: entry.width,
+                        height: entry.height,
+                        sample_count: entry.sample_count,
+                    }) {
+                    Some(target) => Some(target),
+                    None => {
+                        log::warn!("custom depth target {:?} missing", depth_id.0);
+                        continue 'render_target;
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(depth_target) = depth_target.as_ref() {
+                if depth_target.width != first_target.width
+                    || depth_target.height != first_target.height
+                {
+                    log::warn!("custom depth target size mismatch");
+                    continue 'render_target;
+                }
+                if depth_target.sample_count != first_target.sample_count {
+                    log::warn!("custom depth target sample count mismatch");
+                    continue 'render_target;
+                }
+            }
+
+            let render_pass_descriptor = metal::RenderPassDescriptor::new();
+            let color_attachments = render_pass_descriptor.color_attachments();
+            for (index, color_target) in color_targets.iter().enumerate() {
+                let Some(color_attachment) = color_attachments.object_at(index as u64) else {
+                    log::warn!("custom draw color attachment {} missing", index);
+                    continue 'render_target;
+                };
+                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                if let Some(msaa_texture) = color_target.msaa_texture.as_ref() {
+                    color_attachment.set_texture(Some(msaa_texture));
+                    color_attachment.set_resolve_texture(Some(&color_target.texture));
+                    color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+                } else {
+                    color_attachment.set_texture(Some(&color_target.texture));
+                    color_attachment.set_store_action(metal::MTLStoreAction::Store);
+                }
+                color_attachment.set_clear_color(metal::MTLClearColor::new(
+                    color_target.clear_color[0] as f64,
+                    color_target.clear_color[1] as f64,
+                    color_target.clear_color[2] as f64,
+                    color_target.clear_color[3] as f64,
+                ));
+            }
+
+            if let Some(depth_target) = depth_target.as_ref() {
+                let Some(depth_attachment) = render_pass_descriptor.depth_attachment() else {
+                    log::warn!("custom draw depth attachment missing");
+                    continue 'render_target;
+                };
+                depth_attachment.set_texture(Some(&depth_target.texture));
+                depth_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                depth_attachment.set_store_action(metal::MTLStoreAction::Store);
+                depth_attachment.set_clear_depth(depth_target.clear_depth);
+            }
+
+            let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+            command_encoder.set_viewport(metal::MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: first_target.width as f64,
+                height: first_target.height as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+
+            let color_formats: Vec<metal::MTLPixelFormat> =
+                color_targets.iter().map(|target| target.format).collect();
+            let outcome = self.draw_custom_draws_for_target(
+                &draws,
+                instance_buffer,
+                instance_offset,
+                command_encoder,
+                color_formats.as_slice(),
+                first_target.sample_count,
+                depth_target.as_ref().map(|target| target.format),
+                &buffers_snapshot,
+                &textures_snapshot,
+                &samplers_snapshot,
+            );
+            command_encoder.end_encoding();
+
+            if matches!(outcome, CustomDrawBindOutcome::OutOfSpace) {
+                return Err(anyhow!("custom draw out of space"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_custom_computes(
+        &mut self,
+        scene: &Scene,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> Result<()> {
+        if scene.custom_computes.is_empty() {
+            return Ok(());
+        }
+
+        let buffers_snapshot = self.custom_draw.buffers_snapshot();
+        let textures_snapshot = self.custom_draw.textures_snapshot();
+        let samplers_snapshot = self.custom_draw.samplers_snapshot();
+
+        let command_encoder = command_buffer.new_compute_command_encoder();
+        for compute in scene.custom_computes.iter() {
+            if compute.workgroup_count.contains(&0) {
+                continue;
+            }
+            let Some(outcome) =
+                self.custom_draw
+                    .with_compute_pipeline(compute.pipeline, |pipeline| {
+                        command_encoder.set_compute_pipeline_state(&pipeline.pipeline_state);
+                        match self.bind_custom_compute_resources(
+                            command_encoder,
+                            pipeline,
+                            &compute.bindings,
+                            &buffers_snapshot,
+                            &textures_snapshot,
+                            &samplers_snapshot,
+                            instance_buffer,
+                            instance_offset,
+                        ) {
+                            CustomDrawBindOutcome::Ready => {}
+                            other => return other,
+                        }
+
+                        let groups = metal::MTLSize {
+                            width: compute.workgroup_count[0] as u64,
+                            height: compute.workgroup_count[1] as u64,
+                            depth: compute.workgroup_count[2] as u64,
+                        };
+                        let threads_per_group = metal::MTLSize {
+                            width: pipeline.workgroup_size[0] as u64,
+                            height: pipeline.workgroup_size[1] as u64,
+                            depth: pipeline.workgroup_size[2] as u64,
+                        };
+                        command_encoder.dispatch_thread_groups(groups, threads_per_group);
+                        CustomDrawBindOutcome::Ready
+                    })
+            else {
+                log::warn!("custom compute pipeline {:?} not found", compute.pipeline.0);
+                continue;
+            };
+
+            if matches!(outcome, CustomDrawBindOutcome::OutOfSpace) {
+                command_encoder.end_encoding();
+                return Err(anyhow!("custom compute out of space"));
+            }
+        }
+        command_encoder.end_encoding();
+        Ok(())
+    }
+
+    fn draw_custom_draws(
+        &mut self,
+        draws: &[CustomDraw],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        let draws: Vec<&CustomDraw> = draws.iter().filter(|draw| draw.target.is_none()).collect();
+        if draws.is_empty() {
+            return true;
+        }
+
+        let buffers_snapshot = self.custom_draw.buffers_snapshot();
+        let textures_snapshot = self.custom_draw.textures_snapshot();
+        let samplers_snapshot = self.custom_draw.samplers_snapshot();
+
+        let color_formats = [self.custom_draw.surface_format()];
+        let window_depth_format = self
+            .window_custom_depth_texture
+            .as_ref()
+            .map(|_| metal::MTLPixelFormat::Depth32Float);
+        let outcome = self.draw_custom_draws_for_target(
+            &draws,
+            instance_buffer,
+            instance_offset,
+            command_encoder,
+            color_formats.as_slice(),
+            1,
+            window_depth_format,
+            &buffers_snapshot,
+            &textures_snapshot,
+            &samplers_snapshot,
+        );
+        command_encoder.set_depth_stencil_state(&self.depth_disabled_state);
+        command_encoder.set_cull_mode(metal::MTLCullMode::None);
+
+        !matches!(outcome, CustomDrawBindOutcome::OutOfSpace)
+    }
+
+    fn draw_custom_draws_for_target(
+        &mut self,
+        draws: &[&CustomDraw],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        color_formats: &[metal::MTLPixelFormat],
+        sample_count: u32,
+        depth_format: Option<metal::MTLPixelFormat>,
+        buffers_snapshot: &[Option<MetalBufferSnapshot>],
+        textures_snapshot: &[Option<metal::Texture>],
+        samplers_snapshot: &[Option<metal::SamplerState>],
+    ) -> CustomDrawBindOutcome {
+        let mut index = 0;
+        while index < draws.len() {
+            let batch_key = draws[index].batch_key;
+            let mut end = index + 1;
+            while end < draws.len() && draws[end].batch_key == batch_key {
+                end += 1;
+            }
+
+            let batch = &draws[index..end];
+            let pipeline_id = batch[0].pipeline;
+            let bindings = &batch[0].bindings;
+
+            let Some(outcome) = self.custom_draw.with_pipeline(pipeline_id, |pipeline| {
+                if pipeline.color_formats.len() != color_formats.len() {
+                    log::warn!(
+                        "custom draw pipeline {:?} expects {} color targets, got {}",
+                        pipeline_id.0,
+                        pipeline.color_formats.len(),
+                        color_formats.len()
+                    );
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                for (expected, actual) in pipeline.color_formats.iter().zip(color_formats.iter()) {
+                    if *expected != *actual {
+                        log::warn!(
+                            "custom draw pipeline {:?} color format mismatch",
+                            pipeline_id.0
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                if pipeline.sample_count != sample_count {
+                    log::warn!(
+                        "custom draw pipeline {:?} sample count mismatch",
+                        pipeline_id.0
+                    );
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if let Some(pipeline_depth_format) = pipeline.depth_format {
+                    if Some(pipeline_depth_format) != depth_format {
+                        log::warn!(
+                            "custom draw pipeline {:?} depth format mismatch",
+                            pipeline_id.0
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                if pipeline.depth_format.is_some() {
+                    if let Some(depth_state) = pipeline.depth_state.as_ref() {
+                        command_encoder.set_depth_stencil_state(depth_state);
+                    }
+                }
+
+                command_encoder.set_render_pipeline_state(&pipeline.pipeline_state);
+                command_encoder.set_cull_mode(pipeline.cull_mode);
+                command_encoder.set_front_facing_winding(pipeline.front_face);
+
+                match self.bind_custom_resources(
+                    command_encoder,
+                    pipeline,
+                    bindings,
+                    buffers_snapshot,
+                    textures_snapshot,
+                    samplers_snapshot,
+                    instance_buffer,
+                    instance_offset,
+                ) {
+                    CustomDrawBindOutcome::Ready => {}
+                    other => return other,
+                }
+
+                for draw in batch {
+                    if draw.instance_count == 0 {
+                        continue;
+                    }
+                    if draw.vertex_buffers.len() < pipeline.vertex_fetch_count {
+                        log::warn!(
+                            "custom draw missing vertex buffers (expected {}, got {})",
+                            pipeline.vertex_fetch_count,
+                            draw.vertex_buffers.len()
+                        );
+                        continue;
+                    }
+
+                    let mut vertex_binding_outcome = CustomDrawBindOutcome::Ready;
+                    for (buffer_index, buffer) in draw
+                        .vertex_buffers
+                        .iter()
+                        .enumerate()
+                        .take(pipeline.vertex_fetch_count)
+                    {
+                        match self.bind_vertex_buffer(
+                            command_encoder,
+                            buffer_index,
+                            &buffer.source,
+                            buffers_snapshot,
+                            instance_buffer,
+                            instance_offset,
+                        ) {
+                            CustomDrawBindOutcome::Ready => {}
+                            other => {
+                                vertex_binding_outcome = other;
+                                break;
+                            }
+                        }
+                    }
+
+                    match vertex_binding_outcome {
+                        CustomDrawBindOutcome::Ready => {
+                            if let Some(index_buffer) = &draw.index_buffer {
+                                if draw.index_count == 0 {
+                                    continue;
+                                }
+                                match self.bind_index_buffer(
+                                    index_buffer,
+                                    draw.index_count,
+                                    buffers_snapshot,
+                                    instance_buffer,
+                                    instance_offset,
+                                ) {
+                                    IndexBufferBindOutcome::Ready(binding) => {
+                                        command_encoder.draw_indexed_primitives_instanced(
+                                            pipeline.primitive,
+                                            draw.index_count as u64,
+                                            metal_index_type(index_buffer.format),
+                                            binding.buffer.as_ref(),
+                                            binding.offset,
+                                            draw.instance_count as u64,
+                                        );
+                                    }
+                                    IndexBufferBindOutcome::SkipBatch => continue,
+                                    IndexBufferBindOutcome::OutOfSpace => {
+                                        return CustomDrawBindOutcome::OutOfSpace;
+                                    }
+                                }
+                            } else {
+                                if draw.vertex_count == 0 {
+                                    continue;
+                                }
+                                command_encoder.draw_primitives_instanced(
+                                    pipeline.primitive,
+                                    0,
+                                    draw.vertex_count as u64,
+                                    draw.instance_count as u64,
+                                );
+                            }
+                        }
+                        CustomDrawBindOutcome::SkipBatch => continue,
+                        CustomDrawBindOutcome::OutOfSpace => {
+                            return CustomDrawBindOutcome::OutOfSpace;
+                        }
+                    }
+                }
+
+                CustomDrawBindOutcome::Ready
+            }) else {
+                log::warn!("custom draw pipeline {:?} not found", pipeline_id.0);
+                index = end;
+                continue;
+            };
+
+            if matches!(outcome, CustomDrawBindOutcome::OutOfSpace) {
+                return CustomDrawBindOutcome::OutOfSpace;
+            }
+
+            index = end;
+        }
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn prepare_argument_buffer(
+        &self,
+        argument_binding: &ArgumentBufferBinding,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> std::result::Result<u64, InlineAllocationError> {
+        let encoded_length = argument_binding.encoder.encoded_length() as usize;
+        let alignment = argument_binding.encoder.alignment() as usize;
+        let offset =
+            allocate_inline_storage(instance_buffer, instance_offset, encoded_length, alignment)?;
+        argument_binding
+            .encoder
+            .set_argument_buffer(&instance_buffer.metal_buffer, offset as metal::NSUInteger);
+        Ok(offset)
+    }
+
+    fn bind_render_buffer_array(
+        &self,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        argument_binding: &ArgumentBufferBinding,
+        buffer_slot: u64,
+        sources: &[CustomBufferSource],
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        let argument_offset = match self.prepare_argument_buffer(
+            argument_binding,
+            instance_buffer,
+            instance_offset,
+        ) {
+            Ok(offset) => offset,
+            Err(InlineAllocationError::EmptyData) => {
+                log::warn!("custom draw binding array argument buffer is empty");
+                return CustomDrawBindOutcome::SkipBatch;
+            }
+            Err(InlineAllocationError::OutOfSpace) => {
+                return CustomDrawBindOutcome::OutOfSpace;
+            }
+        };
+
+        for (array_index, source) in sources.iter().enumerate() {
+            let array_index = array_index as metal::NSUInteger;
+            match source {
+                CustomBufferSource::Inline(data) => {
+                    match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                        Ok(offset) => {
+                            argument_binding.encoder.set_buffer(
+                                array_index,
+                                &instance_buffer.metal_buffer,
+                                offset,
+                            );
+                        }
+                        Err(InlineAllocationError::EmptyData) => {
+                            log::warn!("custom draw inline buffer array element is empty");
+                            return CustomDrawBindOutcome::SkipBatch;
+                        }
+                        Err(InlineAllocationError::OutOfSpace) => {
+                            return CustomDrawBindOutcome::OutOfSpace;
+                        }
+                    }
+                }
+                CustomBufferSource::Buffer(id) => {
+                    let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom draw buffer {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    argument_binding
+                        .encoder
+                        .set_buffer(array_index, &buffer.buffer, 0);
+                }
+                CustomBufferSource::BufferSlice { id, offset, size } => {
+                    let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom draw buffer {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    if *size == 0 {
+                        log::warn!("custom draw buffer slice is empty");
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    if offset.saturating_add(*size) > buffer.size {
+                        log::warn!("custom draw buffer slice out of range");
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    argument_binding.encoder.set_buffer(
+                        array_index,
+                        &buffer.buffer,
+                        *offset as metal::NSUInteger,
+                    );
+                }
+            }
+        }
+
+        command_encoder.set_vertex_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+        command_encoder.set_fragment_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_render_texture_array(
+        &self,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        argument_binding: &ArgumentBufferBinding,
+        buffer_slot: u64,
+        ids: &[CustomTextureId],
+        textures: &[Option<metal::Texture>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        let argument_offset = match self.prepare_argument_buffer(
+            argument_binding,
+            instance_buffer,
+            instance_offset,
+        ) {
+            Ok(offset) => offset,
+            Err(InlineAllocationError::EmptyData) => {
+                log::warn!("custom draw binding array argument buffer is empty");
+                return CustomDrawBindOutcome::SkipBatch;
+            }
+            Err(InlineAllocationError::OutOfSpace) => {
+                return CustomDrawBindOutcome::OutOfSpace;
+            }
+        };
+
+        for (array_index, id) in ids.iter().enumerate() {
+            let Some(slot) = textures.get(id.0 as usize) else {
+                log::warn!("custom draw texture {:?} missing", id.0);
+                return CustomDrawBindOutcome::SkipBatch;
+            };
+            let Some(texture) = slot.as_ref() else {
+                log::warn!("custom draw texture {:?} missing", id.0);
+                return CustomDrawBindOutcome::SkipBatch;
+            };
+            argument_binding
+                .encoder
+                .set_texture(array_index as metal::NSUInteger, texture);
+        }
+
+        command_encoder.set_vertex_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+        command_encoder.set_fragment_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_compute_buffer_array(
+        &self,
+        command_encoder: &metal::ComputeCommandEncoderRef,
+        argument_binding: &ArgumentBufferBinding,
+        buffer_slot: u64,
+        sources: &[CustomBufferSource],
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        let argument_offset = match self.prepare_argument_buffer(
+            argument_binding,
+            instance_buffer,
+            instance_offset,
+        ) {
+            Ok(offset) => offset,
+            Err(InlineAllocationError::EmptyData) => {
+                log::warn!("custom compute binding array argument buffer is empty");
+                return CustomDrawBindOutcome::SkipBatch;
+            }
+            Err(InlineAllocationError::OutOfSpace) => {
+                return CustomDrawBindOutcome::OutOfSpace;
+            }
+        };
+
+        for (array_index, source) in sources.iter().enumerate() {
+            let array_index = array_index as metal::NSUInteger;
+            match source {
+                CustomBufferSource::Inline(data) => {
+                    match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                        Ok(offset) => {
+                            argument_binding.encoder.set_buffer(
+                                array_index,
+                                &instance_buffer.metal_buffer,
+                                offset,
+                            );
+                        }
+                        Err(InlineAllocationError::EmptyData) => {
+                            log::warn!("custom compute inline buffer array element is empty");
+                            return CustomDrawBindOutcome::SkipBatch;
+                        }
+                        Err(InlineAllocationError::OutOfSpace) => {
+                            return CustomDrawBindOutcome::OutOfSpace;
+                        }
+                    }
+                }
+                CustomBufferSource::Buffer(id) => {
+                    let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom compute buffer {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    argument_binding
+                        .encoder
+                        .set_buffer(array_index, &buffer.buffer, 0);
+                }
+                CustomBufferSource::BufferSlice { id, offset, size } => {
+                    let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom compute buffer {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    if *size == 0 {
+                        log::warn!("custom compute buffer slice is empty");
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    if offset.saturating_add(*size) > buffer.size {
+                        log::warn!("custom compute buffer slice out of range");
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    argument_binding.encoder.set_buffer(
+                        array_index,
+                        &buffer.buffer,
+                        *offset as metal::NSUInteger,
+                    );
+                }
+            }
+        }
+
+        command_encoder.set_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_compute_texture_array(
+        &self,
+        command_encoder: &metal::ComputeCommandEncoderRef,
+        argument_binding: &ArgumentBufferBinding,
+        buffer_slot: u64,
+        ids: &[CustomTextureId],
+        textures: &[Option<metal::Texture>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        let argument_offset = match self.prepare_argument_buffer(
+            argument_binding,
+            instance_buffer,
+            instance_offset,
+        ) {
+            Ok(offset) => offset,
+            Err(InlineAllocationError::EmptyData) => {
+                log::warn!("custom compute binding array argument buffer is empty");
+                return CustomDrawBindOutcome::SkipBatch;
+            }
+            Err(InlineAllocationError::OutOfSpace) => {
+                return CustomDrawBindOutcome::OutOfSpace;
+            }
+        };
+
+        for (array_index, id) in ids.iter().enumerate() {
+            let Some(slot) = textures.get(id.0 as usize) else {
+                log::warn!("custom compute texture {:?} missing", id.0);
+                return CustomDrawBindOutcome::SkipBatch;
+            };
+            let Some(texture) = slot.as_ref() else {
+                log::warn!("custom compute texture {:?} missing", id.0);
+                return CustomDrawBindOutcome::SkipBatch;
+            };
+            argument_binding
+                .encoder
+                .set_texture(array_index as metal::NSUInteger, texture);
+        }
+
+        command_encoder.set_buffer(
+            buffer_slot,
+            Some(&instance_buffer.metal_buffer),
+            argument_offset,
+        );
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_custom_resources(
+        &self,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        pipeline: &MetalCustomPipeline,
+        bindings: &[CustomBindingValue],
+        buffers: &[Option<MetalBufferSnapshot>],
+        textures: &[Option<metal::Texture>],
+        samplers: &[Option<metal::SamplerState>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        if bindings.len() < pipeline.bindings.len() {
+            log::warn!(
+                "custom draw bindings missing (expected {}, got {})",
+                pipeline.bindings.len(),
+                bindings.len()
+            );
+        }
+
+        for (index, kind) in pipeline.bindings.iter().enumerate() {
+            let Some(binding) = bindings.get(index) else {
+                match kind {
+                    CustomBindingKind::Texture | CustomBindingKind::StorageTexture => {
+                        command_encoder.set_vertex_texture(index as u64, None);
+                        command_encoder.set_fragment_texture(index as u64, None);
+                    }
+                    CustomBindingKind::Sampler => {
+                        command_encoder.set_vertex_sampler_state(index as u64, None);
+                        command_encoder.set_fragment_sampler_state(index as u64, None);
+                    }
+                    _ => {}
+                }
+                continue;
+            };
+            let binding_index = index as u64;
+            match (kind, binding) {
+                (CustomBindingKind::Buffer, CustomBindingValue::Buffer(source)) => {
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_buffer_source(
+                        command_encoder,
+                        buffer_slot,
+                        source,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                        None,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::BufferArray { count },
+                    CustomBindingValue::BufferArray(sources),
+                ) => {
+                    if sources.len() != *count as usize {
+                        log::warn!(
+                            "custom draw buffer array length mismatch (expected {}, got {})",
+                            count,
+                            sources.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    let Some(argument_binding) = pipeline
+                        .argument_buffers
+                        .get(index)
+                        .and_then(|entry| entry.as_ref())
+                    else {
+                        log::warn!(
+                            "custom draw binding array encoder missing at slot {}",
+                            index
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_render_buffer_array(
+                        command_encoder,
+                        argument_binding,
+                        buffer_slot,
+                        sources,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::TextureArray { count }
+                    | CustomBindingKind::StorageTextureArray { count },
+                    CustomBindingValue::TextureArray(ids),
+                ) => {
+                    if ids.len() != *count as usize {
+                        log::warn!(
+                            "custom draw texture array length mismatch (expected {}, got {})",
+                            count,
+                            ids.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    let Some(argument_binding) = pipeline
+                        .argument_buffers
+                        .get(index)
+                        .and_then(|entry| entry.as_ref())
+                    else {
+                        log::warn!(
+                            "custom draw binding array encoder missing at slot {}",
+                            index
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_render_texture_array(
+                        command_encoder,
+                        argument_binding,
+                        buffer_slot,
+                        ids,
+                        textures,
+                        instance_buffer,
+                        instance_offset,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (CustomBindingKind::Uniform { size }, CustomBindingValue::Uniform(source)) => {
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_buffer_source(
+                        command_encoder,
+                        buffer_slot,
+                        source,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                        Some(*size as usize),
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::Texture | CustomBindingKind::StorageTexture,
+                    CustomBindingValue::Texture(id),
+                ) => {
+                    let Some(texture) = textures.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom draw texture {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    command_encoder.set_vertex_texture(binding_index, Some(texture));
+                    command_encoder.set_fragment_texture(binding_index, Some(texture));
+                }
+                (CustomBindingKind::Sampler, CustomBindingValue::Sampler(id)) => {
+                    let Some(sampler) = samplers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom draw sampler {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    command_encoder.set_vertex_sampler_state(binding_index, Some(sampler));
+                    command_encoder.set_fragment_sampler_state(binding_index, Some(sampler));
+                }
+                _ => {
+                    log::warn!("custom draw binding mismatch at slot {}", index);
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+            }
+        }
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_custom_compute_resources(
+        &self,
+        command_encoder: &metal::ComputeCommandEncoderRef,
+        pipeline: &MetalCustomComputePipeline,
+        bindings: &[CustomBindingValue],
+        buffers: &[Option<MetalBufferSnapshot>],
+        textures: &[Option<metal::Texture>],
+        samplers: &[Option<metal::SamplerState>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        if bindings.len() < pipeline.bindings.len() {
+            log::warn!(
+                "custom compute bindings missing (expected {}, got {})",
+                pipeline.bindings.len(),
+                bindings.len()
+            );
+        }
+
+        for (index, kind) in pipeline.bindings.iter().enumerate() {
+            let Some(binding) = bindings.get(index) else {
+                match kind {
+                    CustomBindingKind::Texture | CustomBindingKind::StorageTexture => {
+                        command_encoder.set_texture(index as u64, None);
+                    }
+                    CustomBindingKind::Sampler => {
+                        command_encoder.set_sampler_state(index as u64, None);
+                    }
+                    _ => {}
+                }
+                continue;
+            };
+            let binding_index = index as u64;
+            match (kind, binding) {
+                (CustomBindingKind::Buffer, CustomBindingValue::Buffer(source)) => {
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_compute_buffer_source(
+                        command_encoder,
+                        buffer_slot,
+                        source,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                        None,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::BufferArray { count },
+                    CustomBindingValue::BufferArray(sources),
+                ) => {
+                    if sources.len() != *count as usize {
+                        log::warn!(
+                            "custom compute buffer array length mismatch (expected {}, got {})",
+                            count,
+                            sources.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    let Some(argument_binding) = pipeline
+                        .argument_buffers
+                        .get(index)
+                        .and_then(|entry| entry.as_ref())
+                    else {
+                        log::warn!(
+                            "custom compute binding array encoder missing at slot {}",
+                            index
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_compute_buffer_array(
+                        command_encoder,
+                        argument_binding,
+                        buffer_slot,
+                        sources,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::TextureArray { count }
+                    | CustomBindingKind::StorageTextureArray { count },
+                    CustomBindingValue::TextureArray(ids),
+                ) => {
+                    if ids.len() != *count as usize {
+                        log::warn!(
+                            "custom compute texture array length mismatch (expected {}, got {})",
+                            count,
+                            ids.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                    let Some(argument_binding) = pipeline
+                        .argument_buffers
+                        .get(index)
+                        .and_then(|entry| entry.as_ref())
+                    else {
+                        log::warn!(
+                            "custom compute binding array encoder missing at slot {}",
+                            index
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_compute_texture_array(
+                        command_encoder,
+                        argument_binding,
+                        buffer_slot,
+                        ids,
+                        textures,
+                        instance_buffer,
+                        instance_offset,
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (CustomBindingKind::Uniform { size }, CustomBindingValue::Uniform(source)) => {
+                    let buffer_slot = pipeline.buffer_binding_base + binding_index;
+                    match self.bind_compute_buffer_source(
+                        command_encoder,
+                        buffer_slot,
+                        source,
+                        buffers,
+                        instance_buffer,
+                        instance_offset,
+                        Some(*size as usize),
+                    ) {
+                        CustomDrawBindOutcome::Ready => {}
+                        other => return other,
+                    }
+                }
+                (
+                    CustomBindingKind::Texture | CustomBindingKind::StorageTexture,
+                    CustomBindingValue::Texture(id),
+                ) => {
+                    let Some(texture) = textures.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom compute texture {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    command_encoder.set_texture(binding_index, Some(texture));
+                }
+                (CustomBindingKind::Sampler, CustomBindingValue::Sampler(id)) => {
+                    let Some(sampler) = samplers.get(id.0 as usize).and_then(|slot| slot.as_ref())
+                    else {
+                        log::warn!("custom compute sampler {:?} missing", id.0);
+                        return CustomDrawBindOutcome::SkipBatch;
+                    };
+                    command_encoder.set_sampler_state(binding_index, Some(sampler));
+                }
+                _ => {
+                    log::warn!("custom compute binding mismatch at slot {}", index);
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+            }
+        }
+
+        CustomDrawBindOutcome::Ready
+    }
+
+    fn bind_vertex_buffer(
+        &self,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        buffer_index: usize,
+        source: &CustomBufferSource,
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> CustomDrawBindOutcome {
+        match source {
+            CustomBufferSource::Inline(data) => {
+                match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                    Ok(offset) => {
+                        command_encoder.set_vertex_buffer(
+                            buffer_index as u64,
+                            Some(&instance_buffer.metal_buffer),
+                            offset,
+                        );
+                        CustomDrawBindOutcome::Ready
+                    }
+                    Err(InlineAllocationError::EmptyData) => {
+                        log::warn!("custom draw inline vertex buffer is empty");
+                        CustomDrawBindOutcome::SkipBatch
+                    }
+                    Err(InlineAllocationError::OutOfSpace) => CustomDrawBindOutcome::OutOfSpace,
+                }
+            }
+            CustomBufferSource::Buffer(id) => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw vertex buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                command_encoder.set_vertex_buffer(buffer_index as u64, Some(&buffer.buffer), 0);
+                CustomDrawBindOutcome::Ready
+            }
+            CustomBufferSource::BufferSlice { id, offset, size } => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw vertex buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                if *size == 0 {
+                    log::warn!("custom draw vertex buffer slice is empty");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if offset.saturating_add(*size) > buffer.size {
+                    log::warn!("custom draw vertex buffer slice out of range");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                command_encoder.set_vertex_buffer(
+                    buffer_index as u64,
+                    Some(&buffer.buffer),
+                    *offset,
+                );
+                CustomDrawBindOutcome::Ready
+            }
+        }
+    }
+
+    fn bind_compute_buffer_source(
+        &self,
+        command_encoder: &metal::ComputeCommandEncoderRef,
+        buffer_slot: u64,
+        source: &CustomBufferSource,
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        expected_size: Option<usize>,
+    ) -> CustomDrawBindOutcome {
+        match source {
+            CustomBufferSource::Inline(data) => {
+                if let Some(expected_size) = expected_size {
+                    if data.len() != expected_size {
+                        log::warn!(
+                            "custom compute uniform size mismatch (expected {}, got {})",
+                            expected_size,
+                            data.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                    Ok(offset) => {
+                        command_encoder.set_buffer(
+                            buffer_slot,
+                            Some(&instance_buffer.metal_buffer),
+                            offset,
+                        );
+                        CustomDrawBindOutcome::Ready
+                    }
+                    Err(InlineAllocationError::EmptyData) => {
+                        log::warn!("custom compute inline buffer is empty");
+                        CustomDrawBindOutcome::SkipBatch
+                    }
+                    Err(InlineAllocationError::OutOfSpace) => CustomDrawBindOutcome::OutOfSpace,
+                }
+            }
+            CustomBufferSource::Buffer(id) => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom compute buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                if let Some(expected_size) = expected_size {
+                    if buffer.size < expected_size as u64 {
+                        log::warn!(
+                            "custom compute uniform buffer too small (expected at least {}, got {})",
+                            expected_size,
+                            buffer.size
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                command_encoder.set_buffer(buffer_slot, Some(&buffer.buffer), 0);
+                CustomDrawBindOutcome::Ready
+            }
+            CustomBufferSource::BufferSlice { id, offset, size } => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom compute buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                if *size == 0 {
+                    log::warn!("custom compute buffer slice is empty");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if offset.saturating_add(*size) > buffer.size {
+                    log::warn!("custom compute buffer slice out of range");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if let Some(expected_size) = expected_size {
+                    if *size < expected_size as u64 {
+                        log::warn!(
+                            "custom compute uniform buffer slice too small (expected at least {}, got {})",
+                            expected_size,
+                            size
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                command_encoder.set_buffer(buffer_slot, Some(&buffer.buffer), *offset);
+                CustomDrawBindOutcome::Ready
+            }
+        }
+    }
+
+    fn bind_index_buffer(
+        &self,
+        index_buffer: &CustomIndexBuffer,
+        index_count: u32,
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> IndexBufferBindOutcome {
+        let expected_len = index_count as usize * index_format_size(index_buffer.format);
+        match &index_buffer.source {
+            CustomBufferSource::Inline(data) => {
+                if expected_len > 0 && data.len() < expected_len {
+                    log::warn!(
+                        "custom draw index buffer too small (expected at least {}, got {})",
+                        expected_len,
+                        data.len()
+                    );
+                    return IndexBufferBindOutcome::SkipBatch;
+                }
+                match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                    Ok(offset) => IndexBufferBindOutcome::Ready(IndexBufferBinding {
+                        buffer: instance_buffer.metal_buffer.clone(),
+                        offset,
+                    }),
+                    Err(InlineAllocationError::EmptyData) => {
+                        log::warn!("custom draw inline index buffer is empty");
+                        IndexBufferBindOutcome::SkipBatch
+                    }
+                    Err(InlineAllocationError::OutOfSpace) => IndexBufferBindOutcome::OutOfSpace,
+                }
+            }
+            CustomBufferSource::Buffer(id) => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw index buffer {:?} missing", id.0);
+                    return IndexBufferBindOutcome::SkipBatch;
+                };
+                if expected_len > 0 && buffer.size < expected_len as u64 {
+                    log::warn!(
+                        "custom draw index buffer too small (expected at least {}, got {})",
+                        expected_len,
+                        buffer.size
+                    );
+                    return IndexBufferBindOutcome::SkipBatch;
+                }
+                IndexBufferBindOutcome::Ready(IndexBufferBinding {
+                    buffer: buffer.buffer.clone(),
+                    offset: 0,
+                })
+            }
+            CustomBufferSource::BufferSlice { id, offset, size } => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw index buffer {:?} missing", id.0);
+                    return IndexBufferBindOutcome::SkipBatch;
+                };
+                if *size == 0 {
+                    log::warn!("custom draw index buffer slice is empty");
+                    return IndexBufferBindOutcome::SkipBatch;
+                }
+                if offset.saturating_add(*size) > buffer.size {
+                    log::warn!("custom draw index buffer slice out of range");
+                    return IndexBufferBindOutcome::SkipBatch;
+                }
+                if expected_len > 0 && *size < expected_len as u64 {
+                    log::warn!(
+                        "custom draw index buffer slice too small (expected at least {}, got {})",
+                        expected_len,
+                        size
+                    );
+                    return IndexBufferBindOutcome::SkipBatch;
+                }
+                IndexBufferBindOutcome::Ready(IndexBufferBinding {
+                    buffer: buffer.buffer.clone(),
+                    offset: *offset,
+                })
+            }
+        }
+    }
+
+    fn bind_buffer_source(
+        &self,
+        command_encoder: &metal::RenderCommandEncoderRef,
+        buffer_slot: u64,
+        source: &CustomBufferSource,
+        buffers: &[Option<MetalBufferSnapshot>],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        expected_size: Option<usize>,
+    ) -> CustomDrawBindOutcome {
+        match source {
+            CustomBufferSource::Inline(data) => {
+                if let Some(expected_size) = expected_size {
+                    if data.len() != expected_size {
+                        log::warn!(
+                            "custom draw uniform size mismatch (expected {}, got {})",
+                            expected_size,
+                            data.len()
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                match allocate_inline_bytes(instance_buffer, instance_offset, data) {
+                    Ok(offset) => {
+                        command_encoder.set_vertex_buffer(
+                            buffer_slot,
+                            Some(&instance_buffer.metal_buffer),
+                            offset,
+                        );
+                        command_encoder.set_fragment_buffer(
+                            buffer_slot,
+                            Some(&instance_buffer.metal_buffer),
+                            offset,
+                        );
+                        CustomDrawBindOutcome::Ready
+                    }
+                    Err(InlineAllocationError::EmptyData) => {
+                        log::warn!("custom draw inline buffer is empty");
+                        CustomDrawBindOutcome::SkipBatch
+                    }
+                    Err(InlineAllocationError::OutOfSpace) => CustomDrawBindOutcome::OutOfSpace,
+                }
+            }
+            CustomBufferSource::Buffer(id) => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                if let Some(expected_size) = expected_size {
+                    if buffer.size < expected_size as u64 {
+                        log::warn!(
+                            "custom draw uniform buffer too small (expected at least {}, got {})",
+                            expected_size,
+                            buffer.size
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                command_encoder.set_vertex_buffer(buffer_slot, Some(&buffer.buffer), 0);
+                command_encoder.set_fragment_buffer(buffer_slot, Some(&buffer.buffer), 0);
+                CustomDrawBindOutcome::Ready
+            }
+            CustomBufferSource::BufferSlice { id, offset, size } => {
+                let Some(buffer) = buffers.get(id.0 as usize).and_then(|slot| slot.as_ref()) else {
+                    log::warn!("custom draw buffer {:?} missing", id.0);
+                    return CustomDrawBindOutcome::SkipBatch;
+                };
+                if *size == 0 {
+                    log::warn!("custom draw buffer slice is empty");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if offset.saturating_add(*size) > buffer.size {
+                    log::warn!("custom draw buffer slice out of range");
+                    return CustomDrawBindOutcome::SkipBatch;
+                }
+                if let Some(expected_size) = expected_size {
+                    if *size < expected_size as u64 {
+                        log::warn!(
+                            "custom draw uniform buffer slice too small (expected at least {}, got {})",
+                            expected_size,
+                            size
+                        );
+                        return CustomDrawBindOutcome::SkipBatch;
+                    }
+                }
+                command_encoder.set_vertex_buffer(buffer_slot, Some(&buffer.buffer), *offset);
+                command_encoder.set_fragment_buffer(buffer_slot, Some(&buffer.buffer), *offset);
+                CustomDrawBindOutcome::Ready
+            }
+        }
+    }
+}
+
+struct IndexBufferBinding {
+    buffer: metal::Buffer,
+    offset: u64,
+}
+
+enum IndexBufferBindOutcome {
+    Ready(IndexBufferBinding),
+    SkipBatch,
+    OutOfSpace,
+}
+
+enum CustomDrawBindOutcome {
+    Ready,
+    SkipBatch,
+    OutOfSpace,
+}
+
+enum InlineAllocationError {
+    OutOfSpace,
+    EmptyData,
+}
+
+fn allocate_inline_bytes(
+    instance_buffer: &mut InstanceBuffer,
+    instance_offset: &mut usize,
+    data: &[u8],
+) -> std::result::Result<u64, InlineAllocationError> {
+    if data.is_empty() {
+        return Err(InlineAllocationError::EmptyData);
+    }
+
+    align_offset(instance_offset);
+    let start = *instance_offset;
+    let next = start + data.len();
+    if next > instance_buffer.size {
+        return Err(InlineAllocationError::OutOfSpace);
+    }
+
+    unsafe {
+        let destination = (instance_buffer.metal_buffer.contents() as *mut u8).add(start);
+        ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
+    }
+    *instance_offset = next;
+
+    Ok(start as u64)
+}
+
+fn allocate_inline_storage(
+    instance_buffer: &mut InstanceBuffer,
+    instance_offset: &mut usize,
+    size: usize,
+    alignment: usize,
+) -> std::result::Result<u64, InlineAllocationError> {
+    if size == 0 {
+        return Err(InlineAllocationError::EmptyData);
+    }
+
+    align_offset_to(instance_offset, alignment);
+    let start = *instance_offset;
+    let next = start + size;
+    if next > instance_buffer.size {
+        return Err(InlineAllocationError::OutOfSpace);
+    }
+
+    unsafe {
+        let destination = (instance_buffer.metal_buffer.contents() as *mut u8).add(start);
+        ptr::write_bytes(destination, 0, size);
+    }
+    *instance_offset = next;
+
+    Ok(start as u64)
+}
+
+fn index_format_size(format: CustomIndexFormat) -> usize {
+    match format {
+        CustomIndexFormat::U16 => 2,
+        CustomIndexFormat::U32 => 4,
+    }
+}
+
+fn metal_index_type(format: CustomIndexFormat) -> metal::MTLIndexType {
+    match format {
+        CustomIndexFormat::U16 => metal::MTLIndexType::UInt16,
+        CustomIndexFormat::U32 => metal::MTLIndexType::UInt32,
+    }
+}
+
 fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     drawable: &'a metal::MetalDrawableRef,
     viewport_size: Size<DevicePixels>,
+    depth_texture: Option<&'a metal::TextureRef>,
+    depth_load_action: metal::MTLLoadAction,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -1324,6 +3018,17 @@ fn new_command_encoder<'a>(
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
 
+    if let Some(depth_texture) = depth_texture
+        && let Some(depth_attachment) = render_pass_descriptor.depth_attachment()
+    {
+        depth_attachment.set_texture(Some(depth_texture));
+        depth_attachment.set_load_action(depth_load_action);
+        depth_attachment.set_store_action(metal::MTLStoreAction::Store);
+        if matches!(depth_load_action, metal::MTLLoadAction::Clear) {
+            depth_attachment.set_clear_depth(1.0);
+        }
+    }
+
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
@@ -1334,6 +3039,13 @@ fn new_command_encoder<'a>(
         zfar: 1.0,
     });
     command_encoder
+}
+
+fn create_depth_disabled_state(device: &metal::DeviceRef) -> metal::DepthStencilState {
+    let descriptor = metal::DepthStencilDescriptor::new();
+    descriptor.set_depth_compare_function(metal::MTLCompareFunction::Always);
+    descriptor.set_depth_write_enabled(false);
+    device.new_depth_stencil_state(&descriptor)
 }
 
 fn build_pipeline_state(
@@ -1443,9 +3155,110 @@ fn build_path_rasterization_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_custom_work_counts(scene: &Scene) -> Option<(u32, u32, u32, u32)> {
+    if scene.custom_draws.is_empty() && scene.custom_computes.is_empty() {
+        return None;
+    }
+
+    let mut has_window_custom_draw = false;
+    let mut offscreen_target_hashes = std::collections::HashSet::new();
+    for draw in scene.custom_draws.iter() {
+        if draw.target.is_some() {
+            offscreen_target_hashes.insert(draw.batch_key.target_hash);
+        } else {
+            has_window_custom_draw = true;
+        }
+    }
+
+    let custom_render_pass_count =
+        offscreen_target_hashes.len() as u32 + u32::from(has_window_custom_draw);
+    let custom_compute_pass_count = u32::from(!scene.custom_computes.is_empty());
+
+    Some((
+        scene.custom_draws.len() as u32,
+        scene.custom_computes.len() as u32,
+        custom_render_pass_count,
+        custom_compute_pass_count,
+    ))
+}
+
+fn build_custom_gpu_profile(scene: &Scene) -> Option<CustomGpuFrameProfile> {
+    let (
+        custom_draw_count,
+        custom_compute_count,
+        custom_render_pass_count,
+        custom_compute_pass_count,
+    ) = build_custom_work_counts(scene)?;
+
+    Some(CustomGpuFrameProfile {
+        custom_draw_count,
+        custom_compute_count,
+        custom_render_pass_count,
+        custom_compute_pass_count,
+        gpu_time_ns: None,
+    })
+}
+
+fn build_custom_frame_diagnostics(scene: &Scene) -> Option<CustomFrameDiagnostics> {
+    let (
+        custom_draw_count,
+        custom_compute_count,
+        custom_render_pass_count,
+        custom_compute_pass_count,
+    ) = build_custom_work_counts(scene)?;
+
+    Some(CustomFrameDiagnostics {
+        custom_draw_count,
+        custom_compute_count,
+        custom_render_pass_count,
+        custom_compute_pass_count,
+        retry_count: 0,
+        cpu_encode_time_ns: 0,
+        submit_to_scheduled_ns: None,
+        submit_to_completed_ns: None,
+        scheduled_to_completed_ns: None,
+        gpu_time_ns: None,
+    })
+}
+
+fn metal_command_buffer_gpu_time_ns(command_buffer: &metal::CommandBufferRef) -> Option<u64> {
+    #[allow(clippy::disallowed_methods)]
+    unsafe {
+        let has_gpu_start_time: bool =
+            msg_send![command_buffer, respondsToSelector: sel!(GPUStartTime)];
+        let has_gpu_end_time: bool =
+            msg_send![command_buffer, respondsToSelector: sel!(GPUEndTime)];
+        if !has_gpu_start_time || !has_gpu_end_time {
+            return None;
+        }
+
+        let gpu_start_time: f64 = msg_send![command_buffer, GPUStartTime];
+        let gpu_end_time: f64 = msg_send![command_buffer, GPUEndTime];
+        if gpu_start_time <= 0.0 || gpu_end_time < gpu_start_time {
+            return None;
+        }
+
+        let gpu_time_ns = ((gpu_end_time - gpu_start_time) * 1_000_000_000.0).round();
+        if !gpu_time_ns.is_finite() || gpu_time_ns < 0.0 {
+            return None;
+        }
+
+        Some(gpu_time_ns as u64)
+    }
+}
+
+fn duration_as_u64_nanoseconds(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn align_offset_to(offset: &mut usize, alignment: usize) {
+    let alignment = alignment.max(256);
+    *offset = (*offset).div_ceil(alignment) * alignment;
+}
+
 // Align to multiples of 256 make Metal happy.
 fn align_offset(offset: &mut usize) {
-    *offset = (*offset).div_ceil(256) * 256;
+    align_offset_to(offset, 256);
 }
 
 #[repr(C)]

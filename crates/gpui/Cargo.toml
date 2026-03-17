@@ -28,9 +28,7 @@ test-support = [
 ]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
-wayland = [
-    "bitflags",
-]
+wayland = []
 x11 = [
     "scap?/x11",
 ]
@@ -38,6 +36,8 @@ screen-capture = [
     "scap",
 ]
 windows-manifest = ["dep:embed-resource"]
+video-ffmpeg = ["dep:ffmpeg-next"]
+bevy-ecs-example = ["dep:bevy_ecs"]
 
 [lib]
 path = "src/gpui.rs"
@@ -47,12 +47,14 @@ doctest = false
 anyhow.workspace = true
 async-task = "4.7"
 backtrace = { workspace = true, optional = true }
-bitflags = { workspace = true, optional = true }
+bitflags.workspace = true
 
 collections.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
 etagere = "0.2"
+bevy_ecs = { version = "0.17", optional = true }
+ffmpeg-next = { version = "8.0.0", optional = true }
 futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true
@@ -149,6 +151,7 @@ lyon = { version = "1.0", features = ["extra"] }
 pretty_assertions.workspace = true
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
+smol = "2.0"
 unicode-segmentation.workspace = true
 gpui_util = { workspace = true }
 proptest = { workspace = true }
@@ -239,3 +242,8 @@ path = "examples/grid_layout.rs"
 [[example]]
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "custom_draw_api_bevy_ecs"
+path = "examples/custom_draw_api_bevy_ecs.rs"
+required-features = ["bevy-ecs-example"]

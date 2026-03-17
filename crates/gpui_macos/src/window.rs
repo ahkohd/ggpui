@@ -1550,6 +1550,10 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
+    fn custom_draw_registry(&self) -> Option<Arc<dyn gpui::CustomDrawRegistry>> {
+        Some(self.0.lock().renderer.custom_draw_registry())
+    }
+
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
     }

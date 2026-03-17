@@ -1,4 +1,4 @@
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, custom_draw::WgpuCustomDrawRegistry};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -112,6 +113,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    window_depth_texture: Option<wgpu::Texture>,
+    window_depth_view: Option<wgpu::TextureView>,
 }
 
 pub struct WgpuRenderer {
@@ -124,6 +127,7 @@ pub struct WgpuRenderer {
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
+    custom_draw: Arc<WgpuCustomDrawRegistry>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_buffer_capacity: u64,
@@ -331,6 +335,11 @@ impl WgpuRenderer {
 
         let queue = Arc::clone(&context.queue);
         let dual_source_blending = context.supports_dual_source_blending();
+        let custom_draw = Arc::new(WgpuCustomDrawRegistry::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            surface_format,
+        ));
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
@@ -445,6 +454,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            window_depth_texture: None,
+            window_depth_view: None,
         };
 
         Ok(Self {
@@ -453,6 +464,7 @@ impl WgpuRenderer {
             resources: Some(resources),
             surface_config,
             atlas,
+            custom_draw,
             path_globals_offset,
             gamma_offset,
             instance_buffer_capacity: initial_instance_buffer_capacity,
@@ -899,6 +911,29 @@ impl WgpuRenderer {
         Some((texture, view))
     }
 
+    fn create_window_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window_custom_depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
@@ -936,6 +971,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.window_depth_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -948,6 +986,8 @@ impl WgpuRenderer {
             resources.path_intermediate_view = None;
             resources.path_msaa_texture = None;
             resources.path_msaa_view = None;
+            resources.window_depth_texture = None;
+            resources.window_depth_view = None;
         }
     }
 
@@ -977,6 +1017,21 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+    }
+
+    fn ensure_window_depth_texture(&mut self) {
+        if self.resources().window_depth_texture.is_some() {
+            return;
+        }
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let resources = self.resources_mut();
+
+        let (texture, view) =
+            Self::create_window_depth_texture(&resources.device, width.max(1), height.max(1));
+        resources.window_depth_texture = Some(texture);
+        resources.window_depth_view = Some(view);
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1016,6 +1071,10 @@ impl WgpuRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<WgpuAtlas> {
         &self.atlas
+    }
+
+    pub fn custom_draw_registry(&self) -> Arc<dyn gpui::CustomDrawRegistry> {
+        self.custom_draw.clone()
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
@@ -1072,6 +1131,7 @@ impl WgpuRenderer {
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
+        self.ensure_window_depth_texture();
 
         let frame_view = frame
             .texture
@@ -1123,6 +1183,11 @@ impl WgpuRenderer {
             );
         }
 
+        let custom_draw_count = u32::try_from(scene.custom_draws.len()).unwrap_or(u32::MAX);
+        let custom_compute_count = u32::try_from(scene.custom_computes.len()).unwrap_or(u32::MAX);
+        let frame_encode_start = Instant::now();
+        let mut retry_count = 0u32;
+
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
@@ -1133,6 +1198,14 @@ impl WgpuRenderer {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("main_encoder"),
                     });
+            let gpu_timing_capture = self.custom_draw.begin_frame_gpu_timing(&mut encoder);
+
+            let custom_compute_pass_count = self
+                .custom_draw
+                .dispatch_custom_computes(&scene.custom_computes, &mut encoder);
+            let mut custom_render_pass_count = self
+                .custom_draw
+                .draw_custom_render_targets(&scene.custom_draws, &mut encoder);
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1150,6 +1223,7 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
 
+                let mut window_depth_cleared = false;
                 for batch in scene.batches() {
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
@@ -1230,6 +1304,47 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::Custom(range) => {
+                            drop(pass);
+
+                            let window_depth_view = self.resources().window_depth_view.as_ref();
+                            let window_depth_format =
+                                window_depth_view.map(|_| wgpu::TextureFormat::Depth32Float);
+                            let clear_window_depth = !window_depth_cleared;
+                            let window_custom_render_pass_count =
+                                self.custom_draw.draw_window_custom_draws(
+                                    &scene.custom_draws[range],
+                                    &mut encoder,
+                                    &frame_view,
+                                    window_depth_view,
+                                    window_depth_format,
+                                    clear_window_depth,
+                                    self.surface_config.width,
+                                    self.surface_config.height,
+                                );
+                            if window_custom_render_pass_count > 0 {
+                                window_depth_cleared = true;
+                            }
+                            custom_render_pass_count = custom_render_pass_count
+                                .saturating_add(window_custom_render_pass_count);
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
                     };
                     if !ok {
                         overflow = true;
@@ -1249,13 +1364,37 @@ impl WgpuRenderer {
                     return;
                 }
                 self.grow_instance_buffer();
+                retry_count = retry_count.saturating_add(1);
                 continue;
             }
+
+            let gpu_timing_readback = gpu_timing_capture.map(|capture| {
+                self.custom_draw
+                    .finish_frame_gpu_timing(&mut encoder, capture)
+            });
+
+            let cpu_encode_time_ns =
+                u64::try_from(frame_encode_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.custom_draw.record_frame_metrics(
+                custom_draw_count,
+                custom_compute_count,
+                custom_render_pass_count,
+                custom_compute_pass_count,
+                retry_count,
+                cpu_encode_time_ns,
+            );
 
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            if let Some(readback_buffer) = gpu_timing_readback {
+                self.custom_draw.record_frame_gpu_timing(readback_buffer);
+            }
+            self.custom_draw.record_submission_completion();
             frame.present();
+            if let Err(error) = self.resources().device.poll(wgpu::PollType::Poll) {
+                warn!("Failed to poll device after frame submit: {error:?}");
+            }
             return;
         }
     }

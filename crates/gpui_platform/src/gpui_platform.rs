@@ -59,7 +59,7 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", feature = "test-support"))]
 mod tests {
     use super::*;
     use gpui::{AppContext, Empty, VisualTestAppContext};

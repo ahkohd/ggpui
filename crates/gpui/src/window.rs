@@ -3,21 +3,28 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    Context, Corners, CursorStyle, CustomBatchKey, CustomBindingValue, CustomBufferDesc,
+    CustomBufferId, CustomBufferSource, CustomCompute, CustomComputeDispatch,
+    CustomComputePipelineDesc, CustomComputePipelineId, CustomDepthTargetDesc, CustomDepthTargetId,
+    CustomDraw, CustomDrawParams, CustomDrawResourceStats, CustomFrameDiagnostics,
+    CustomGpuFrameProfile, CustomPipelineDesc, CustomPipelineId, CustomRenderTargetDesc,
+    CustomSamplerDesc, CustomSamplerId, CustomTextureBufferUpdate, CustomTextureDesc,
+    CustomTextureFormat, CustomTextureId, CustomTextureUpdate, Decorations, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3510,6 +3517,394 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Create a custom GPU pipeline for drawing with user-provided shaders and vertex layouts.
+    pub fn create_custom_pipeline(&mut self, desc: CustomPipelineDesc) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline(desc)
+    }
+
+    /// Create a custom GPU compute pipeline with user-provided shaders and bindings.
+    pub fn create_custom_compute_pipeline(
+        &mut self,
+        desc: CustomComputePipelineDesc,
+    ) -> Result<CustomComputePipelineId> {
+        crate::custom_draw::validate_custom_compute_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom compute pipeline not supported on this platform"
+            ));
+        };
+        registry.create_compute_pipeline(desc)
+    }
+
+    /// Create a custom GPU pipeline using precompiled Metal shading language (MSL) source.
+    ///
+    /// The `CustomPipelineDesc` WGSL source is still validated to ensure bindings and layouts are
+    /// consistent, but the provided MSL source is compiled directly on Metal.
+    pub fn create_custom_pipeline_msl(
+        &mut self,
+        desc: CustomPipelineDesc,
+        msl_source: String,
+    ) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline_msl(desc, msl_source)
+    }
+
+    /// Create a custom GPU pipeline from precompiled Metal library bytes (`.metallib`).
+    ///
+    /// The `CustomPipelineDesc` WGSL source is still validated to ensure bindings and layouts are
+    /// consistent. The entry names are read from `desc.vertex_entry` and `desc.fragment_entry`.
+    pub fn create_custom_pipeline_metallib(
+        &mut self,
+        desc: CustomPipelineDesc,
+        metallib_data: Arc<[u8]>,
+    ) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline_metallib(desc, metallib_data)
+    }
+
+    /// Create a custom GPU pipeline from a precompiled Metal library file (`.metallib`).
+    pub fn create_custom_pipeline_metallib_file(
+        &mut self,
+        desc: CustomPipelineDesc,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<CustomPipelineId> {
+        let path = path.as_ref();
+        let metallib_data: Arc<[u8]> = std::fs::read(path)
+            .with_context(|| format!("failed to read Metal library file {}", path.display()))?
+            .into();
+        self.create_custom_pipeline_metallib(desc, metallib_data)
+    }
+
+    /// Set the custom draw pipeline cache file path for persistent Metal pipeline archives.
+    pub fn set_custom_pipeline_cache_path(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_pipeline_cache_path(Some(path.as_ref().to_path_buf()))
+    }
+
+    /// Disable the custom draw pipeline cache path.
+    pub fn clear_custom_pipeline_cache_path(&mut self) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_pipeline_cache_path(None)
+    }
+
+    /// Enable or disable GPU profiling for custom draw and custom compute work.
+    pub fn set_custom_gpu_profiling_enabled(&mut self, enabled: bool) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_gpu_profiling_enabled(enabled)
+    }
+
+    /// Take the latest custom GPU frame profile sample, if one is available.
+    pub fn take_last_custom_gpu_profile(&mut self) -> Result<Option<CustomGpuFrameProfile>> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.take_last_gpu_profile())
+    }
+
+    /// Enable or disable frame pacing diagnostics for custom draw and custom compute work.
+    pub fn set_custom_frame_diagnostics_enabled(&mut self, enabled: bool) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_frame_diagnostics_enabled(enabled)
+    }
+
+    /// Take the latest custom frame diagnostics sample, if one is available.
+    pub fn take_last_custom_frame_diagnostics(&mut self) -> Result<Option<CustomFrameDiagnostics>> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.take_last_frame_diagnostics())
+    }
+
+    /// Snapshot custom draw resource counts and estimated GPU memory usage.
+    pub fn custom_draw_resource_stats(&mut self) -> Result<CustomDrawResourceStats> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.resource_stats())
+    }
+
+    /// Create a custom buffer for GPU-backed drawing.
+    pub fn create_custom_buffer(&mut self, desc: CustomBufferDesc) -> Result<CustomBufferId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.create_buffer(desc)
+    }
+
+    /// Update a previously created custom buffer.
+    pub fn update_custom_buffer(&mut self, id: CustomBufferId, data: Arc<[u8]>) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.update_buffer(id, data)
+    }
+
+    /// Remove a previously created custom buffer.
+    pub fn remove_custom_buffer(&mut self, id: CustomBufferId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.remove_buffer(id);
+        Ok(())
+    }
+
+    /// Create a custom texture for GPU-backed drawing.
+    pub fn create_custom_texture(&mut self, desc: CustomTextureDesc) -> Result<CustomTextureId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.create_texture(desc)
+    }
+
+    /// Returns true when a custom texture format is supported by the active backend and device.
+    pub fn custom_texture_format_supported(&mut self, format: CustomTextureFormat) -> Result<bool> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        Ok(registry.texture_format_supported(format))
+    }
+
+    /// Create an offscreen render target texture.
+    pub fn create_custom_render_target(
+        &mut self,
+        desc: CustomRenderTargetDesc,
+    ) -> Result<CustomTextureId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw render targets not supported on this platform"
+            ));
+        };
+        registry.create_render_target(desc)
+    }
+
+    /// Update a previously created custom texture.
+    pub fn update_custom_texture(
+        &mut self,
+        id: CustomTextureId,
+        update: CustomTextureUpdate,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.update_texture(id, update)
+    }
+
+    /// Update a previously created custom texture from a buffer.
+    pub fn update_custom_texture_from_buffer(
+        &mut self,
+        id: CustomTextureId,
+        update: CustomTextureBufferUpdate,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.update_texture_from_buffer(id, update)
+    }
+
+    /// Remove a previously created custom texture.
+    pub fn remove_custom_texture(&mut self, id: CustomTextureId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.remove_texture(id);
+        Ok(())
+    }
+
+    /// Remove a previously created custom render target.
+    pub fn remove_custom_render_target(&mut self, id: CustomTextureId) -> Result<()> {
+        self.remove_custom_texture(id)
+    }
+
+    /// Create an offscreen depth target.
+    pub fn create_custom_depth_target(
+        &mut self,
+        desc: CustomDepthTargetDesc,
+    ) -> Result<CustomDepthTargetId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw depth targets not supported on this platform"
+            ));
+        };
+        registry.create_depth_target(desc)
+    }
+
+    /// Remove a previously created custom depth target.
+    pub fn remove_custom_depth_target(&mut self, id: CustomDepthTargetId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw depth targets not supported on this platform"
+            ));
+        };
+        registry.remove_depth_target(id);
+        Ok(())
+    }
+
+    /// Create a custom sampler for GPU-backed drawing.
+    pub fn create_custom_sampler(&mut self, desc: CustomSamplerDesc) -> Result<CustomSamplerId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw samplers not supported on this platform"
+            ));
+        };
+        registry.create_sampler(desc)
+    }
+
+    /// Remove a previously created custom sampler.
+    pub fn remove_custom_sampler(&mut self, id: CustomSamplerId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw samplers not supported on this platform"
+            ));
+        };
+        registry.remove_sampler(id);
+        Ok(())
+    }
+
+    /// Dispatch a custom compute command into the scene.
+    pub fn dispatch_custom_compute(&mut self, params: CustomComputeDispatch) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        if params.workgroup_count.contains(&0) {
+            return Ok(());
+        }
+
+        let mut bindings = params.bindings;
+        if let Some(push_constants) = params.push_constants {
+            bindings.push(CustomBindingValue::Uniform(CustomBufferSource::Inline(
+                push_constants,
+            )));
+        }
+
+        self.next_frame.scene.insert_compute(CustomCompute {
+            pipeline: params.pipeline,
+            bindings,
+            workgroup_count: params.workgroup_count,
+        });
+        Ok(())
+    }
+
+    /// Paint a custom draw command into the scene.
+    pub fn paint_custom(&mut self, params: CustomDrawParams) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let bounds = params.bounds.scale(scale_factor);
+        let content_mask = content_mask.scale(scale_factor);
+        if params.index_buffer.is_some() && params.index_count == 0 {
+            return Err(anyhow!(
+                "custom draw index count must be non-zero when an index buffer is provided"
+            ));
+        }
+        if params.index_buffer.is_none() && params.index_count != 0 {
+            return Err(anyhow!(
+                "custom draw index count provided without an index buffer"
+            ));
+        }
+        let mut bindings = params.bindings;
+        if let Some(push_constants) = params.push_constants {
+            bindings.push(CustomBindingValue::Uniform(CustomBufferSource::Inline(
+                push_constants,
+            )));
+        }
+        let bindings_hash = bindings
+            .iter()
+            .fold(1469598103934665603u64, |hash, binding| {
+                hash.wrapping_mul(1099511628211) ^ binding.hash()
+            });
+        if let Some(target) = params.target.as_ref() {
+            if target.colors.is_empty() {
+                return Err(anyhow!(
+                    "custom draw render targets must include at least one color attachment"
+                ));
+            }
+            if target.colors.len() > crate::MAX_COLOR_TARGETS {
+                return Err(anyhow!(
+                    "custom draw color target count must be at most {} (got {})",
+                    crate::MAX_COLOR_TARGETS,
+                    target.colors.len()
+                ));
+            }
+        }
+        let target_hash = params.target.as_ref().map_or(0, |target| target.hash());
+        self.next_frame.scene.insert_primitive(CustomDraw {
+            order: 0,
+            bounds,
+            content_mask,
+            pipeline: params.pipeline,
+            vertex_buffers: params.vertex_buffers,
+            vertex_count: params.vertex_count,
+            index_buffer: params.index_buffer,
+            index_count: params.index_count,
+            target: params.target,
+            instance_count: params.instance_count,
+            bindings,
+            batch_key: CustomBatchKey {
+                pipeline: params.pipeline,
+                target_hash,
+                bindings_hash,
+            },
+        });
+        Ok(())
     }
 
     /// Removes an image from the sprite atlas.
