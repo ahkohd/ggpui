@@ -216,6 +216,10 @@ name = "svg"
 path = "examples/svg/svg.rs"
 
 [[example]]
+name = "superellipse"
+path = "examples/superellipse.rs"
+
+[[example]]
 name = "tab_stop"
 path = "examples/tab_stop.rs"
 
