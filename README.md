@@ -20,9 +20,7 @@ Each dated revision identifies the matching Zed commit.
 | [`2026-08-13`](https://github.com/ahkohd/ggpui/tree/2026-08-13) | [`03e5ad8a630c`](https://github.com/zed-industries/zed/commit/03e5ad8a630c84c3990055905d0444ea0a519b7f) |
 | [`2026-03-17`](https://github.com/ahkohd/ggpui/tree/2026-03-17) | [`50ca710f515a`](https://github.com/zed-industries/zed/commit/50ca710f515ada2d00803ccc9a8900981ed5eb50) |
 
-## Upstream sync plan
-
-We plan to sync this fork with upstream GPUI once per month.
+## Upstream sync process
 
 Each sync will:
 
