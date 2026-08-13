@@ -3,7 +3,13 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    Capslock, Context, Corners, CursorHideMode, CursorStyle, CustomBatchKey, CustomBindingValue,
+    CustomBufferDesc, CustomBufferId, CustomBufferSource, CustomCompute, CustomComputeDispatch,
+    CustomComputePipelineDesc, CustomComputePipelineId, CustomDepthTargetDesc, CustomDepthTargetId,
+    CustomDraw, CustomDrawParams, CustomDrawResourceStats, CustomFrameDiagnostics,
+    CustomGpuFrameProfile, CustomPipelineDesc, CustomPipelineId, CustomRenderTargetDesc,
+    CustomSamplerDesc, CustomSamplerId, CustomTextureBufferUpdate, CustomTextureDesc,
+    CustomTextureFormat, CustomTextureId, CustomTextureUpdate, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -2063,11 +2069,15 @@ pub struct DispatchEventResult {
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
 /// to leave room to support more complex shapes in the future.
+///
+/// `fade_out` is evaluated in window space against these axis-aligned bounds and is not transform-aware.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// Edge fade distances. `0` means no fade for that edge.
+    pub fade_out: Edges<P>,
 }
 
 impl ContentMask<Pixels> {
@@ -2075,13 +2085,193 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            fade_out: self.fade_out.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+
+        let left = if self.bounds.left() > other.bounds.left() {
+            self.fade_out.left
+        } else if other.bounds.left() > self.bounds.left() {
+            other.fade_out.left
+        } else {
+            self.fade_out.left.max(other.fade_out.left)
+        };
+
+        let top = if self.bounds.top() > other.bounds.top() {
+            self.fade_out.top
+        } else if other.bounds.top() > self.bounds.top() {
+            other.fade_out.top
+        } else {
+            self.fade_out.top.max(other.fade_out.top)
+        };
+
+        let right = if self.bounds.right() < other.bounds.right() {
+            self.fade_out.right
+        } else if other.bounds.right() < self.bounds.right() {
+            other.fade_out.right
+        } else {
+            self.fade_out.right.max(other.fade_out.right)
+        };
+
+        let bottom = if self.bounds.bottom() < other.bounds.bottom() {
+            self.fade_out.bottom
+        } else if other.bounds.bottom() < self.bounds.bottom() {
+            other.fade_out.bottom
+        } else {
+            self.fade_out.bottom.max(other.fade_out.bottom)
+        };
+
+        let max_x = bounds.size.width.max(Pixels::ZERO);
+        let max_y = bounds.size.height.max(Pixels::ZERO);
+        let mut top = top.clamp(Pixels::ZERO, max_y);
+        let mut right = right.clamp(Pixels::ZERO, max_x);
+        let mut bottom = bottom.clamp(Pixels::ZERO, max_y);
+        let mut left = left.clamp(Pixels::ZERO, max_x);
+        let normalize_pair = |start: Pixels, end: Pixels, max: Pixels| {
+            let total = start + end;
+            if total > max && total > Pixels::ZERO {
+                let scale = max.0 / total.0;
+                (start * scale, end * scale)
+            } else {
+                (start, end)
+            }
+        };
+        (left, right) = normalize_pair(left, right, max_x);
+        (top, bottom) = normalize_pair(top, bottom, max_y);
+        let fade_out = Edges {
+            top,
+            right,
+            bottom,
+            left,
+        };
+        ContentMask { bounds, fade_out }
+    }
+}
+
+#[cfg(test)]
+mod content_mask_tests {
+    use super::*;
+
+    fn mask(
+        origin_x: f32,
+        origin_y: f32,
+        width: f32,
+        height: f32,
+        fade_out: Edges<Pixels>,
+    ) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds {
+                origin: point(px(origin_x), px(origin_y)),
+                size: size(px(width), px(height)),
+            },
+            fade_out,
+        }
+    }
+
+    #[test]
+    fn intersect_drops_fade_when_that_edge_is_not_part_of_resulting_bounds() {
+        let outer = mask(
+            0.,
+            0.,
+            100.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(20.),
+            },
+        );
+        let inner = mask(
+            30.,
+            0.,
+            40.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(0.),
+            },
+        );
+
+        let combined = outer.intersect(&inner);
+        assert_eq!(combined.bounds.left(), px(30.));
+        assert_eq!(combined.fade_out.left, px(0.));
+    }
+
+    #[test]
+    fn intersect_keeps_fade_from_mask_that_defines_resulting_edge() {
+        let parent = mask(
+            0.,
+            0.,
+            200.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(16.),
+            },
+        );
+        let child = mask(
+            0.,
+            0.,
+            120.,
+            100.,
+            Edges {
+                top: px(0.),
+                right: px(0.),
+                bottom: px(0.),
+                left: px(8.),
+            },
+        );
+
+        let combined = parent.intersect(&child);
+        assert_eq!(combined.bounds.left(), px(0.));
+        assert_eq!(combined.fade_out.left, px(16.));
+    }
+
+    #[test]
+    fn intersect_clamps_fade_to_resulting_bounds() {
+        let a = mask(
+            0.,
+            0.,
+            40.,
+            40.,
+            Edges {
+                top: px(200.),
+                right: px(200.),
+                bottom: px(200.),
+                left: px(200.),
+            },
+        );
+        let b = mask(
+            10.,
+            10.,
+            5.,
+            5.,
+            Edges {
+                top: px(200.),
+                right: px(200.),
+                bottom: px(200.),
+                left: px(200.),
+            },
+        );
+
+        let combined = a.intersect(&b);
+        assert_eq!(combined.bounds.size.width, px(5.));
+        assert_eq!(combined.bounds.size.height, px(5.));
+        assert_eq!(combined.fade_out.left + combined.fade_out.right, px(5.));
+        assert_eq!(combined.fade_out.top + combined.fade_out.bottom, px(5.));
+        assert_eq!(combined.fade_out.left, px(2.5));
+        assert_eq!(combined.fade_out.right, px(2.5));
+        assert_eq!(combined.fade_out.top, px(2.5));
+        assert_eq!(combined.fade_out.bottom, px(2.5));
     }
 }
 
@@ -2892,8 +3082,10 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let content_mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(content_mask.bounds),
+            fade_out: content_mask.fade_out.scale(self.scale_factor()),
         }
     }
 
@@ -3818,6 +4010,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                fade_out: Edges::default(),
             })
     }
 
@@ -4204,9 +4397,13 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            smoothness: quad.smoothness.clamp(0.0, 1.0),
+            pad: 0,
         };
 
-        if !quad.background.is_transparent() {
+        if !quad.background.is_transparent()
+            || quad.content_mask.fade_out.any(|distance| distance.0 > 0.0)
+        {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4250,6 +4447,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        ..quad.content_mask
                     },
                     ..quad
                 });
@@ -4501,6 +4699,10 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                smoothness: 0.0,
+                pad2: 0,
+                pad3: 0,
+                pad4: 0,
             });
         }
         Ok(())
@@ -4588,6 +4790,29 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_corner_superellipse(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            0.0,
+        )
+    }
+
+    /// Paint an image with superellipse corners.
+    /// amount: 0.0 = circular corners, 0.5 = squircle, 1.0 = square-ish corners.
+    pub fn paint_image_with_corner_superellipse(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        amount: f32,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -4673,6 +4898,10 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            smoothness: amount.clamp(0.0, 1.0),
+            pad2: 0,
+            pad3: 0,
+            pad4: 0,
         });
         Ok(())
     }
@@ -4694,6 +4923,394 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Create a custom GPU pipeline for drawing with user-provided shaders and vertex layouts.
+    pub fn create_custom_pipeline(&mut self, desc: CustomPipelineDesc) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline(desc)
+    }
+
+    /// Create a custom GPU compute pipeline with user-provided shaders and bindings.
+    pub fn create_custom_compute_pipeline(
+        &mut self,
+        desc: CustomComputePipelineDesc,
+    ) -> Result<CustomComputePipelineId> {
+        crate::custom_draw::validate_custom_compute_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom compute pipeline not supported on this platform"
+            ));
+        };
+        registry.create_compute_pipeline(desc)
+    }
+
+    /// Create a custom GPU pipeline using precompiled Metal shading language (MSL) source.
+    ///
+    /// The `CustomPipelineDesc` WGSL source is still validated to ensure bindings and layouts are
+    /// consistent, but the provided MSL source is compiled directly on Metal.
+    pub fn create_custom_pipeline_msl(
+        &mut self,
+        desc: CustomPipelineDesc,
+        msl_source: String,
+    ) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline_msl(desc, msl_source)
+    }
+
+    /// Create a custom GPU pipeline from precompiled Metal library bytes (`.metallib`).
+    ///
+    /// The `CustomPipelineDesc` WGSL source is still validated to ensure bindings and layouts are
+    /// consistent. The entry names are read from `desc.vertex_entry` and `desc.fragment_entry`.
+    pub fn create_custom_pipeline_metallib(
+        &mut self,
+        desc: CustomPipelineDesc,
+        metallib_data: Arc<[u8]>,
+    ) -> Result<CustomPipelineId> {
+        crate::custom_draw::validate_custom_pipeline_desc(&desc)?;
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.create_pipeline_metallib(desc, metallib_data)
+    }
+
+    /// Create a custom GPU pipeline from a precompiled Metal library file (`.metallib`).
+    pub fn create_custom_pipeline_metallib_file(
+        &mut self,
+        desc: CustomPipelineDesc,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<CustomPipelineId> {
+        let path = path.as_ref();
+        let metallib_data: Arc<[u8]> = std::fs::read(path)
+            .with_context(|| format!("failed to read Metal library file {}", path.display()))?
+            .into();
+        self.create_custom_pipeline_metallib(desc, metallib_data)
+    }
+
+    /// Set the custom draw pipeline cache file path for persistent Metal pipeline archives.
+    pub fn set_custom_pipeline_cache_path(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_pipeline_cache_path(Some(path.as_ref().to_path_buf()))
+    }
+
+    /// Disable the custom draw pipeline cache path.
+    pub fn clear_custom_pipeline_cache_path(&mut self) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_pipeline_cache_path(None)
+    }
+
+    /// Enable or disable GPU profiling for custom draw and custom compute work.
+    pub fn set_custom_gpu_profiling_enabled(&mut self, enabled: bool) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_gpu_profiling_enabled(enabled)
+    }
+
+    /// Take the latest custom GPU frame profile sample, if one is available.
+    pub fn take_last_custom_gpu_profile(&mut self) -> Result<Option<CustomGpuFrameProfile>> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.take_last_gpu_profile())
+    }
+
+    /// Enable or disable frame pacing diagnostics for custom draw and custom compute work.
+    pub fn set_custom_frame_diagnostics_enabled(&mut self, enabled: bool) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        registry.set_frame_diagnostics_enabled(enabled)
+    }
+
+    /// Take the latest custom frame diagnostics sample, if one is available.
+    pub fn take_last_custom_frame_diagnostics(&mut self) -> Result<Option<CustomFrameDiagnostics>> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.take_last_frame_diagnostics())
+    }
+
+    /// Snapshot custom draw resource counts and estimated GPU memory usage.
+    pub fn custom_draw_resource_stats(&mut self) -> Result<CustomDrawResourceStats> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw pipeline not supported on this platform"
+            ));
+        };
+        Ok(registry.resource_stats())
+    }
+
+    /// Create a custom buffer for GPU-backed drawing.
+    pub fn create_custom_buffer(&mut self, desc: CustomBufferDesc) -> Result<CustomBufferId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.create_buffer(desc)
+    }
+
+    /// Update a previously created custom buffer.
+    pub fn update_custom_buffer(&mut self, id: CustomBufferId, data: Arc<[u8]>) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.update_buffer(id, data)
+    }
+
+    /// Remove a previously created custom buffer.
+    pub fn remove_custom_buffer(&mut self, id: CustomBufferId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw buffers not supported on this platform"
+            ));
+        };
+        registry.remove_buffer(id);
+        Ok(())
+    }
+
+    /// Create a custom texture for GPU-backed drawing.
+    pub fn create_custom_texture(&mut self, desc: CustomTextureDesc) -> Result<CustomTextureId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.create_texture(desc)
+    }
+
+    /// Returns true when a custom texture format is supported by the active backend and device.
+    pub fn custom_texture_format_supported(&mut self, format: CustomTextureFormat) -> Result<bool> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        Ok(registry.texture_format_supported(format))
+    }
+
+    /// Create an offscreen render target texture.
+    pub fn create_custom_render_target(
+        &mut self,
+        desc: CustomRenderTargetDesc,
+    ) -> Result<CustomTextureId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw render targets not supported on this platform"
+            ));
+        };
+        registry.create_render_target(desc)
+    }
+
+    /// Update a previously created custom texture.
+    pub fn update_custom_texture(
+        &mut self,
+        id: CustomTextureId,
+        update: CustomTextureUpdate,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.update_texture(id, update)
+    }
+
+    /// Update a previously created custom texture from a buffer.
+    pub fn update_custom_texture_from_buffer(
+        &mut self,
+        id: CustomTextureId,
+        update: CustomTextureBufferUpdate,
+    ) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.update_texture_from_buffer(id, update)
+    }
+
+    /// Remove a previously created custom texture.
+    pub fn remove_custom_texture(&mut self, id: CustomTextureId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw textures not supported on this platform"
+            ));
+        };
+        registry.remove_texture(id);
+        Ok(())
+    }
+
+    /// Remove a previously created custom render target.
+    pub fn remove_custom_render_target(&mut self, id: CustomTextureId) -> Result<()> {
+        self.remove_custom_texture(id)
+    }
+
+    /// Create an offscreen depth target.
+    pub fn create_custom_depth_target(
+        &mut self,
+        desc: CustomDepthTargetDesc,
+    ) -> Result<CustomDepthTargetId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw depth targets not supported on this platform"
+            ));
+        };
+        registry.create_depth_target(desc)
+    }
+
+    /// Remove a previously created custom depth target.
+    pub fn remove_custom_depth_target(&mut self, id: CustomDepthTargetId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw depth targets not supported on this platform"
+            ));
+        };
+        registry.remove_depth_target(id);
+        Ok(())
+    }
+
+    /// Create a custom sampler for GPU-backed drawing.
+    pub fn create_custom_sampler(&mut self, desc: CustomSamplerDesc) -> Result<CustomSamplerId> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw samplers not supported on this platform"
+            ));
+        };
+        registry.create_sampler(desc)
+    }
+
+    /// Remove a previously created custom sampler.
+    pub fn remove_custom_sampler(&mut self, id: CustomSamplerId) -> Result<()> {
+        let Some(registry) = self.platform_window.custom_draw_registry() else {
+            return Err(anyhow!(
+                "custom draw samplers not supported on this platform"
+            ));
+        };
+        registry.remove_sampler(id);
+        Ok(())
+    }
+
+    /// Dispatch a custom compute command into the scene.
+    pub fn dispatch_custom_compute(&mut self, params: CustomComputeDispatch) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        if params.workgroup_count.contains(&0) {
+            return Ok(());
+        }
+
+        let mut bindings = params.bindings;
+        if let Some(push_constants) = params.push_constants {
+            bindings.push(CustomBindingValue::Uniform(CustomBufferSource::Inline(
+                push_constants,
+            )));
+        }
+
+        self.next_frame.scene.insert_compute(CustomCompute {
+            pipeline: params.pipeline,
+            bindings,
+            workgroup_count: params.workgroup_count,
+        });
+        Ok(())
+    }
+
+    /// Paint a custom draw command into the scene.
+    pub fn paint_custom(&mut self, params: CustomDrawParams) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let bounds = params.bounds.scale(scale_factor);
+        let content_mask = content_mask.scale(scale_factor);
+        if params.index_buffer.is_some() && params.index_count == 0 {
+            return Err(anyhow!(
+                "custom draw index count must be non-zero when an index buffer is provided"
+            ));
+        }
+        if params.index_buffer.is_none() && params.index_count != 0 {
+            return Err(anyhow!(
+                "custom draw index count provided without an index buffer"
+            ));
+        }
+        let mut bindings = params.bindings;
+        if let Some(push_constants) = params.push_constants {
+            bindings.push(CustomBindingValue::Uniform(CustomBufferSource::Inline(
+                push_constants,
+            )));
+        }
+        let bindings_hash = bindings
+            .iter()
+            .fold(1469598103934665603u64, |hash, binding| {
+                hash.wrapping_mul(1099511628211) ^ binding.hash()
+            });
+        if let Some(target) = params.target.as_ref() {
+            if target.colors.is_empty() {
+                return Err(anyhow!(
+                    "custom draw render targets must include at least one color attachment"
+                ));
+            }
+            if target.colors.len() > crate::MAX_COLOR_TARGETS {
+                return Err(anyhow!(
+                    "custom draw color target count must be at most {} (got {})",
+                    crate::MAX_COLOR_TARGETS,
+                    target.colors.len()
+                ));
+            }
+        }
+        let target_hash = params.target.as_ref().map_or(0, |target| target.hash());
+        self.next_frame.scene.insert_primitive(CustomDraw {
+            order: 0,
+            bounds,
+            content_mask,
+            pipeline: params.pipeline,
+            vertex_buffers: params.vertex_buffers,
+            vertex_count: params.vertex_count,
+            index_buffer: params.index_buffer,
+            index_count: params.index_count,
+            target: params.target,
+            instance_count: params.instance_count,
+            bindings,
+            batch_key: CustomBatchKey {
+                pipeline: params.pipeline,
+                target_hash,
+                bindings_hash,
+            },
+        });
+        Ok(())
     }
 
     /// Removes an image from the sprite atlas.
@@ -6869,6 +7486,8 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// The smoothness of the corners (0.0 = circle, 0.5 = squircle, 1.0 = square).
+    pub smoothness: f32,
 }
 
 impl PaintQuad {
@@ -6903,6 +7522,14 @@ impl PaintQuad {
             ..self
         }
     }
+
+    /// Sets superellipse corner amount (0.0 = circular, 0.5 = squircle, 1.0 = square-ish).
+    pub fn corner_superellipse(self, amount: f32) -> Self {
+        PaintQuad {
+            smoothness: amount.clamp(0.0, 1.0),
+            ..self
+        }
+    }
 }
 
 /// Creates a quad with the given parameters.
@@ -6921,6 +7548,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        smoothness: 0.0,
     }
 }
 
@@ -6933,6 +7561,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        smoothness: 0.0,
     }
 }
 
@@ -6949,6 +7578,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        smoothness: 0.0,
     }
 }
 

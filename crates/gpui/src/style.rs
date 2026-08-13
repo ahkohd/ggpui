@@ -188,6 +188,9 @@ pub struct Style {
     /// How children overflowing their container should affect layout
     #[refineable]
     pub overflow: Point<Overflow>,
+    /// Edge fade distances for overflow masking.
+    #[refineable]
+    pub overflow_fade: Edges<AbsoluteLength>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
@@ -287,6 +290,9 @@ pub struct Style {
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
+
+    /// The smoothness of corners (0.0 = circle, 0.5 = squircle, 1.0 = square)
+    pub smoothness: Option<f32>,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
@@ -635,6 +641,9 @@ impl Style {
 
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
+    ///
+    /// Note: overflow fade is axis-aligned and evaluated in window space;
+    /// it is not transform-aware.
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,
@@ -679,7 +688,39 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                let mut fade_out = self.overflow_fade.to_pixels(rem_size);
+                if self.overflow.x == Overflow::Visible {
+                    fade_out.left = Pixels::ZERO;
+                    fade_out.right = Pixels::ZERO;
+                }
+                if self.overflow.y == Overflow::Visible {
+                    fade_out.top = Pixels::ZERO;
+                    fade_out.bottom = Pixels::ZERO;
+                }
+
+                let max_x = bounds.size.width.max(Pixels::ZERO);
+                let max_y = bounds.size.height.max(Pixels::ZERO);
+                fade_out.top = fade_out.top.clamp(Pixels::ZERO, max_y);
+                fade_out.right = fade_out.right.clamp(Pixels::ZERO, max_x);
+                fade_out.bottom = fade_out.bottom.clamp(Pixels::ZERO, max_y);
+                fade_out.left = fade_out.left.clamp(Pixels::ZERO, max_x);
+                let normalize_pair = |start: Pixels, end: Pixels, max: Pixels| {
+                    let total = start + end;
+                    if total > max && total > Pixels::ZERO {
+                        let scale = max.0 / total.0;
+                        (start * scale, end * scale)
+                    } else {
+                        (start, end)
+                    }
+                };
+                let (left, right) = normalize_pair(fade_out.left, fade_out.right, max_x);
+                fade_out.left = left;
+                fade_out.right = right;
+                let (top, bottom) = normalize_pair(fade_out.top, fade_out.bottom, max_y);
+                fade_out.top = top;
+                fade_out.bottom = bottom;
+
+                Some(ContentMask { bounds, fade_out })
             }
         }
     }
@@ -727,14 +768,17 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background_color.unwrap_or_default(),
+                    Edges::default(),
+                    border_color,
+                    self.border_style,
+                )
+                .corner_superellipse(self.smoothness.unwrap_or(0.0)),
+            );
         }
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
@@ -745,14 +789,17 @@ impl Style {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                )
+                .corner_superellipse(self.smoothness.unwrap_or(0.0)),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -777,6 +824,7 @@ impl Default for Style {
                 x: Overflow::Visible,
                 y: Overflow::Visible,
             },
+            overflow_fade: Edges::<AbsoluteLength>::zero(),
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
@@ -805,6 +853,7 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            smoothness: None,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

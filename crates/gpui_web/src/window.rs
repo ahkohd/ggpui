@@ -798,6 +798,10 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }
 
+    fn custom_draw_registry(&self) -> Option<Arc<dyn gpui::CustomDrawRegistry>> {
+        Some(self.inner.state.borrow().renderer.custom_draw_registry())
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         self.inner
             .state

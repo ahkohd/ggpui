@@ -96,7 +96,7 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", feature = "test-support"))]
 mod tests {
     use super::*;
     use gpui::{AppContext, Empty, VisualTestAppContext};

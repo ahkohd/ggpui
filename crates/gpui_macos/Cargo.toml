@@ -51,6 +51,7 @@ log.workspace = true
 mach2.workspace = true
 media.workspace = true
 metal.workspace = true
+naga = { version = "25.0", features = ["wgsl-in", "msl-out", "wgsl-out"] }
 objc.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true

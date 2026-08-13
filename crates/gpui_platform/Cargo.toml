@@ -11,10 +11,17 @@ workspace = true
 [lib]
 path = "src/gpui_platform.rs"
 
+[[test]]
+name = "window_depth_state_leak_guard"
+path = "tests/window_depth_state_leak_guard.rs"
+harness = false
+required-features = ["test-support", "visual-test-guard"]
+
 [features]
 default = []
 font-kit = ["gpui_macos/font-kit"]
 test-support = ["gpui/test-support", "gpui_macos/test-support"]
+visual-test-guard = []
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
@@ -36,3 +43,6 @@ gpui_linux.workspace = true
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui_web.workspace = true
 console_error_panic_hook.workspace = true
+
+[dev-dependencies]
+image.workspace = true

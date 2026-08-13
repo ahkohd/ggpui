@@ -24,6 +24,7 @@ cosmic-text = "0.19.0"
 etagere.workspace = true
 itertools.workspace = true
 log.workspace = true
+naga = { version = "29.0.4", features = ["wgsl-in", "wgsl-out", "termcolor"] }
 parking_lot.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
@@ -46,11 +47,10 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
 js-sys.workspace = true
-wgpu = { workspace = true, features = ["webgl"] }
+wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm", "webgl"] }
 
 [dev-dependencies]
 criterion.workspace = true
-naga = { version = "29.0.4", features = ["wgsl-in"] }
 
 [[bench]]
 name = "layout_line"

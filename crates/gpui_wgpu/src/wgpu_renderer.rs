@@ -1,9 +1,9 @@
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, custom_draw::WgpuCustomDrawRegistry};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, Edges, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -13,6 +13,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -62,7 +63,7 @@ struct GlobalParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct PodBounds {
     origin: [f32; 2],
     size: [f32; 2],
@@ -78,10 +79,46 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PodEdges {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+impl From<Edges<ScaledPixels>> for PodEdges {
+    fn from(edges: Edges<ScaledPixels>) -> Self {
+        Self {
+            top: edges.top.0,
+            right: edges.right.0,
+            bottom: edges.bottom.0,
+            left: edges.left.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PodContentMask {
+    bounds: PodBounds,
+    fade_out: PodEdges,
+}
+
+impl From<ContentMask<ScaledPixels>> for PodContentMask {
+    fn from(content_mask: ContentMask<ScaledPixels>) -> Self {
+        Self {
+            bounds: content_mask.bounds.into(),
+            fade_out: content_mask.fade_out.into(),
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    content_mask: PodContentMask,
 }
 
 #[repr(C)]
@@ -107,6 +144,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask: PodContentMask,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -192,6 +230,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    window_depth_texture: Option<wgpu::Texture>,
+    window_depth_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -200,6 +240,8 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.window_depth_texture = None;
+        self.window_depth_view = None;
     }
 }
 
@@ -213,6 +255,7 @@ pub struct WgpuRenderer {
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
+    custom_draw: Arc<WgpuCustomDrawRegistry>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_data_capacity: u64,
@@ -429,6 +472,12 @@ impl WgpuRenderer {
         surface.configure(&context.device, &surface_config);
 
         let queue = Arc::clone(&context.queue);
+        let custom_draw = Arc::new(WgpuCustomDrawRegistry::new(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            surface_format,
+        ));
+
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
@@ -578,6 +627,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            window_depth_texture: None,
+            window_depth_view: None,
         };
 
         Ok(Self {
@@ -586,6 +637,7 @@ impl WgpuRenderer {
             resources: Some(resources),
             surface_config,
             atlas,
+            custom_draw,
             path_globals_offset,
             gamma_offset,
             instance_data_capacity,
@@ -1119,6 +1171,29 @@ impl WgpuRenderer {
         Some((texture, view))
     }
 
+    fn create_window_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window_custom_depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
@@ -1156,6 +1231,9 @@ impl WgpuRenderer {
                 texture.destroy();
             }
             if let Some(ref texture) = resources.path_msaa_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.window_depth_texture {
                 texture.destroy();
             }
 
@@ -1202,6 +1280,21 @@ impl WgpuRenderer {
         self.is_bgr = is_bgr;
     }
 
+    fn ensure_window_depth_texture(&mut self) {
+        if self.resources().window_depth_texture.is_some() {
+            return;
+        }
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let resources = self.resources_mut();
+
+        let (texture, view) =
+            Self::create_window_depth_texture(&resources.device, width.max(1), height.max(1));
+        resources.window_depth_texture = Some(texture);
+        resources.window_depth_view = Some(view);
+    }
+
     pub fn update_transparency(&mut self, transparent: bool) {
         let new_alpha_mode = if transparent {
             self.transparent_alpha_mode
@@ -1243,6 +1336,10 @@ impl WgpuRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<WgpuAtlas> {
         &self.atlas
+    }
+
+    pub fn custom_draw_registry(&self) -> Arc<dyn gpui::CustomDrawRegistry> {
+        self.custom_draw.clone()
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
@@ -1340,6 +1437,7 @@ impl WgpuRenderer {
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
+        self.ensure_window_depth_texture();
 
         let frame_view = frame
             .texture
@@ -1403,6 +1501,9 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        let custom_draw_count = u32::try_from(scene.custom_draws.len()).unwrap_or(u32::MAX);
+        let custom_compute_count = u32::try_from(scene.custom_computes.len()).unwrap_or(u32::MAX);
+        let frame_encode_start = Instant::now();
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1426,6 +1527,14 @@ impl WgpuRenderer {
                     label: Some("main_encoder"),
                 });
 
+        let gpu_timing_capture = self.custom_draw.begin_frame_gpu_timing(&mut encoder);
+        let custom_compute_pass_count = self
+            .custom_draw
+            .dispatch_custom_computes(&scene.custom_computes, &mut encoder);
+        let mut custom_render_pass_count = self
+            .custom_draw
+            .draw_custom_render_targets(&scene.custom_draws, &mut encoder);
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1442,6 +1551,7 @@ impl WgpuRenderer {
                 ..Default::default()
             });
 
+            let mut window_depth_cleared = false;
             for batch in scene.batches() {
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
@@ -1526,6 +1636,43 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::Custom(range) => {
+                        drop(pass);
+
+                        let window_depth_view = self.resources().window_depth_view.as_ref();
+                        let window_depth_format =
+                            window_depth_view.map(|_| wgpu::TextureFormat::Depth32Float);
+                        let custom_pass_count = self.custom_draw.draw_window_custom_draws(
+                            &scene.custom_draws[range],
+                            &mut encoder,
+                            frame_view,
+                            window_depth_view,
+                            window_depth_format,
+                            !window_depth_cleared,
+                            self.surface_config.width,
+                            self.surface_config.height,
+                        );
+                        if custom_pass_count > 0 {
+                            window_depth_cleared = true;
+                        }
+                        custom_render_pass_count =
+                            custom_render_pass_count.saturating_add(custom_pass_count);
+
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                    }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
@@ -1533,9 +1680,31 @@ impl WgpuRenderer {
             }
         }
 
+        let gpu_timing_readback = gpu_timing_capture.map(|capture| {
+            self.custom_draw
+                .finish_frame_gpu_timing(&mut encoder, capture)
+        });
+        let cpu_encode_time_ns =
+            u64::try_from(frame_encode_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.custom_draw.record_frame_metrics(
+            custom_draw_count,
+            custom_compute_count,
+            custom_render_pass_count,
+            custom_compute_pass_count,
+            0,
+            cpu_encode_time_ns,
+        );
+
         self.resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+        if let Some(readback_buffer) = gpu_timing_readback {
+            self.custom_draw.record_frame_gpu_timing(readback_buffer);
+        }
+        self.custom_draw.record_submission_completion();
+        if let Err(error) = self.resources().device.poll(wgpu::PollType::Poll) {
+            warn!("Failed to poll device after frame submit: {error:?}");
+        }
         Ok(())
     }
 
@@ -1708,11 +1877,13 @@ impl WgpuRenderer {
         let mut vertices = Vec::new();
         for path in paths {
             let bounds = path.clipped_bounds();
+            let content_mask: PodContentMask = path.content_mask.clone().into();
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask,
             }));
         }
 
@@ -2230,14 +2401,33 @@ mod tests {
     }
 
     #[test]
+    fn subpixel_record_size_matches_shader_layout() {
+        let module = naga::front::wgsl::parse_str(SUBPIXEL_SHADERS).expect("shader should parse");
+        let mut layouter = naga::proc::Layouter::default();
+        layouter
+            .update(module.to_ctx())
+            .expect("shader types should lay out");
+        let (handle, _) = module
+            .types
+            .iter()
+            .find(|(_, shader_type)| shader_type.name.as_deref() == Some("SubpixelSprite"))
+            .expect("subpixel sprite type should exist");
+
+        assert_eq!(
+            layouter[handle].size as usize,
+            std::mem::size_of::<SubpixelSprite>()
+        );
+    }
+
+    #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 20 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 32 * 4);
     }
 }

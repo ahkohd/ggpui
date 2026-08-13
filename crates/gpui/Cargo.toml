@@ -40,6 +40,8 @@ windows-manifest = ["dep:embed-resource"]
 input-latency-histogram = ["dep:hdrhistogram"]
 frame-duration-histogram = ["dep:hdrhistogram"]
 profiler = []
+video-ffmpeg = ["dep:ffmpeg-next"]
+bevy-ecs-example = ["dep:bevy_ecs"]
 
 [lib]
 path = "src/gpui.rs"
@@ -57,6 +59,8 @@ criterion = { workspace = true, optional = true }
 ctor.workspace = true
 derive_more.workspace = true
 etagere.workspace = true
+bevy_ecs = { version = "0.17", optional = true }
+ffmpeg-next = { version = "8.0.0", optional = true }
 futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true
@@ -155,6 +159,7 @@ gpui_util = { workspace = true }
 lyon = { version = "1.0", features = ["extra"] }
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
+smol.workspace = true
 unicode-segmentation = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
@@ -205,6 +210,10 @@ name = "opacity"
 path = "examples/opacity.rs"
 
 [[example]]
+name = "overflow_fade"
+path = "examples/overflow_fade.rs"
+
+[[example]]
 name = "pattern"
 path = "examples/pattern.rs"
 
@@ -224,6 +233,10 @@ path = "examples/shadow.rs"
 [[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
+
+[[example]]
+name = "superellipse"
+path = "examples/superellipse.rs"
 
 [[example]]
 name = "tab_stop"
@@ -268,3 +281,8 @@ path = "examples/a11y.rs"
 [[example]]
 name = "view_example"
 path = "examples/view_example/view_example_main.rs"
+
+[[example]]
+name = "custom_draw_api_bevy_ecs"
+path = "examples/custom_draw_api_bevy_ecs.rs"
+required-features = ["bevy-ecs-example"]

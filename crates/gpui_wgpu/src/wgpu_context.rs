@@ -240,6 +240,8 @@ impl WgpuContext {
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
+        let adapter_features = adapter.features();
+
         let mut required_features = wgpu::Features::empty();
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
@@ -265,6 +267,23 @@ impl WgpuContext {
         let required_limits = wgpu::Limits::downlevel_defaults()
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
+
+        for optional_feature in [
+            wgpu::Features::TEXTURE_COMPRESSION_BC,
+            wgpu::Features::TEXTURE_COMPRESSION_ETC2,
+            wgpu::Features::TEXTURE_COMPRESSION_ASTC,
+            wgpu::Features::BGRA8UNORM_STORAGE,
+            wgpu::Features::TEXTURE_BINDING_ARRAY,
+            wgpu::Features::BUFFER_BINDING_ARRAY,
+            wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY,
+            wgpu::Features::TIMESTAMP_QUERY,
+            wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+            wgpu::Features::STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING,
+        ] {
+            if adapter_features.contains(optional_feature) {
+                required_features |= optional_feature;
+            }
+        }
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
