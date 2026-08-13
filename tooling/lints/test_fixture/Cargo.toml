@@ -1,6 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["gpui", "gpui_shared_string", "consumer", "render_consumer"]
-
-[workspace.metadata.dylint]
-libraries = [{ path = ".." }]
